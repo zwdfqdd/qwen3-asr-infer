@@ -1,0 +1,11 @@
+# Qwen3-ASR 原生 vLLM 在线异步服务；必须使用独立 venv/镜像。
+# vLLM 0.16 内置 Qwen3-ASR 配置、Processor 与模型执行器；CUDA/PyTorch 由对应 wheel 提供。
+vllm[audio]==0.16.0
+# 必须保持在 vLLM 0.16 要求的 >=4.56,<5 范围内，不可与 Transformers 5.x 混装。
+transformers==4.57.6
+
+# CPU 网关运行时依赖（服务端无需自建 FastAPI/Pydantic/Prometheus）。
+aiohttp==3.13.3
+soundfile==0.13.1
+# 压测资源采样；缺失时仅跳过 CPU 统计。
+psutil==7.0.0
