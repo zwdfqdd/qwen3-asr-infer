@@ -18,6 +18,7 @@ models/**
 .modelscope-manifest.json
 
 # 测试与运行产物
+.tmp-*/
 .pytest_cache/
 .coverage
 htmlcov/

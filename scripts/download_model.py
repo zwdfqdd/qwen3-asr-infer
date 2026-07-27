@@ -11,15 +11,17 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-MODEL_ID = os.getenv("VLLM_MODEL_ID", "Qwen/Qwen3-ASR-0.6B")
-TARGET_DIR = os.getenv("VLLM_MODEL_DIR", "models/qwen3-asr-0.6b/vllm")
+# 以下四项在脚本导入时读取；命令行参数可覆盖仓库 ID、本地目录和固定 revision。
+MODEL_ID = os.getenv("VLLM_MODEL_ID", "Qwen/Qwen3-ASR-0.6B")  # ModelScope 仓库 ID。
+TARGET_DIR = os.getenv("VLLM_MODEL_DIR", "models/qwen3-asr-0.6b/vllm")  # 本地持久化目录。
 REVISION = os.getenv(
     "MODELSCOPE_REVISION", "4ce9cc728b473a5aedbe7b6e1ea45646316824dc"
-)
-ENDPOINT = os.getenv("MODELSCOPE_ENDPOINT", "https://modelscope.cn").rstrip("/")
+)  # 不可变提交 revision，禁止使用 latest。
+ENDPOINT = os.getenv("MODELSCOPE_ENDPOINT", "https://modelscope.cn").rstrip("/")  # API 基址。
 MANIFEST_NAME = ".modelscope-manifest.json"
 _ALLOW_SUFFIXES = (".json", ".txt", ".safetensors", ".model", ".jinja")
-_SKIP_FILES = {".gitattributes", "README.md"}
+_SKIP_FILES = {".gitattributes", "README.md", "generation_config.json"}
+_REMOVE_LOCAL_FILES = {"generation_config.json"}
 _REQUIRED = (
     "config.json",
     "preprocessor_config.json",
@@ -207,6 +209,11 @@ def ensure_model(
     repo_id: str = MODEL_ID,
     revision: str = REVISION,
 ) -> str:
+    """确保本地目录完整对应指定 ModelScope 仓库和 revision，并返回目录字符串。
+
+    已有 manifest 会绑定仓库身份；文件按大小/SHA256 校验，缺失项才下载，不允许在同一
+    目录静默混用模型或 revision。
+    """
     if not repo_id.strip() or not revision.strip():
         raise ValueError("model-id 和 revision 不能为空")
     target = Path(target_dir)
@@ -219,6 +226,15 @@ def ensure_model(
                 raise RuntimeError("模型 manifest 缺少文件清单")
         else:
             files = _list_repo_files(repo_id, revision)
+
+        # 兼容旧 manifest：generation_config 同时含 do_sample=false/temperature，
+        # 对 greedy ASR 无效且会触发 Transformers 启动告警；vLLM 使用内置生成配置。
+        files = [
+            item for item in files
+            if Path(str(item.get("path", ""))).name not in _SKIP_FILES
+        ]
+        for filename in _REMOVE_LOCAL_FILES:
+            (target / filename).unlink(missing_ok=True)
 
         invalid = _validate_files(target, files)
         if invalid:
@@ -237,9 +253,18 @@ def ensure_model(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="从 ModelScope 下载并校验 Qwen3-ASR 权重")
-    parser.add_argument("--model-id", default=MODEL_ID)
-    parser.add_argument("--dir", default=TARGET_DIR)
-    parser.add_argument("--revision", default=REVISION)
+    parser.add_argument(
+        "--model-id", default=MODEL_ID,
+        help="ModelScope 仓库 ID；默认读取 VLLM_MODEL_ID",
+    )
+    parser.add_argument(
+        "--dir", default=TARGET_DIR,
+        help="模型本地目标目录；默认读取 VLLM_MODEL_DIR",
+    )
+    parser.add_argument(
+        "--revision", default=REVISION,
+        help="固定提交 revision；默认读取 MODELSCOPE_REVISION，禁止留空",
+    )
     args = parser.parse_args()
     try:
         ensure_model(args.dir, args.model_id, args.revision)
