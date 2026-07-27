@@ -3,44 +3,98 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
+# 保留容器原始 stdout 给网关 JSON；run.sh、下载器和 vLLM 统一继承 stderr。
+exec 3>&1
+exec 1>&2
+
+# 让 Python 启动时自动加载 src/sitecustomize.py 的固定版本兼容修复。
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+
 # PORT 是容器/平台常见变量，不能用作内部端口；显式清除，避免污染子进程。
 if [[ -n "${PORT:-}" ]]; then
   echo "提示：忽略宿主环境 PORT=$PORT；请使用 VLLM_PORT 或 GATEWAY_PORT 配置端口。"
   unset PORT
 fi
-export SERVICE_VERSION="${SERVICE_VERSION:-1.0.0}"
-export VLLM_PORT="${VLLM_PORT:-8081}"
-export VLLM_HOST="${VLLM_HOST:-127.0.0.1}"
-export VLLM_MODEL_ID="${VLLM_MODEL_ID:-Qwen/Qwen3-ASR-0.6B}"
-export VLLM_MODEL_DIR="${VLLM_MODEL_DIR:-models/qwen3-asr-0.6b/vllm}"
-export MODELSCOPE_REVISION="${MODELSCOPE_REVISION:-4ce9cc728b473a5aedbe7b6e1ea45646316824dc}"
-export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-asr}"
-export DTYPE="${DTYPE:-bfloat16}"
-export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
-export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
-export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-128}"
-export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
-export VLLM_MAX_AUDIO_CLIP_FILESIZE_MB="${VLLM_MAX_AUDIO_CLIP_FILESIZE_MB:-64}"
-export VLLM_ATTENTION_BACKEND_NAME="${VLLM_ATTENTION_BACKEND_NAME:-FLASH_ATTN}"
-export GATEWAY_HOST="${GATEWAY_HOST:-0.0.0.0}"
-export GATEWAY_PORT="${GATEWAY_PORT:-8080}"
-export BACKEND_URL="${BACKEND_URL:-http://127.0.0.1:$VLLM_PORT}"
-export AUDIO_CHUNK_SECONDS="${AUDIO_CHUNK_SECONDS:-30}"
-export MAX_AUDIO_SECONDS="${MAX_AUDIO_SECONDS:-300}"
-export MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-64}"
-export CHUNK_CONCURRENCY="${CHUNK_CONCURRENCY:-3}"
-export LONG_CHUNKS_IN_FLIGHT="${LONG_CHUNKS_IN_FLIGHT:-64}"
-export BACKEND_TIMEOUT="${BACKEND_TIMEOUT:-300}"
-export VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-600}"
-export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-96}"
-export ENABLE_HOTWORD="${ENABLE_HOTWORD:-true}"
-export ENABLE_VAD="${ENABLE_VAD:-false}"
-export ENABLE_WORD_TIMESTAMP="${ENABLE_WORD_TIMESTAMP:-false}"
-export ENABLE_SENTENCE_TIMESTAMP="${ENABLE_SENTENCE_TIMESTAMP:-false}"
-export MAX_HOTWORDS="${MAX_HOTWORDS:-100}"
-export MAX_HOTWORD_LENGTH="${MAX_HOTWORD_LENGTH:-64}"
-export MAX_HOTWORD_CHARS="${MAX_HOTWORD_CHARS:-1000}"
+# 服务元数据与端口：8080 是唯一对外端口，8081 仅供本机网关访问。
+export SERVICE_VERSION="${SERVICE_VERSION:-1.1.0}"  # /health 返回的版本字符串。
+export VLLM_PORT="${VLLM_PORT:-8081}"  # vLLM 内部监听端口，范围 1～65535。
+export VLLM_HOST="${VLLM_HOST:-127.0.0.1}"  # vLLM 监听地址；默认禁止外部绕过网关。
+export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-asr}"  # vLLM 对外模型别名。
+export GATEWAY_HOST="${GATEWAY_HOST:-0.0.0.0}"  # aiohttp 网关监听地址。
+export GATEWAY_PORT="${GATEWAY_PORT:-8080}"  # 客户端访问的网关端口，范围 1～65535。
+export BACKEND_URL="${BACKEND_URL:-http://127.0.0.1:$VLLM_PORT}"  # 网关访问 vLLM 的 HTTP 基址。
+# 结构化日志：请求线程只入有界队列；stdout 始终输出，文件日志按大小轮转。
+export LOG_LEVEL="${LOG_LEVEL:-INFO}"  # DEBUG/INFO/WARNING/ERROR/CRITICAL。
+export LOG_FILE_ENABLED="${LOG_FILE_ENABLED:-true}"  # 是否额外写入本地轮转文件。
+export LOG_DIR="${LOG_DIR:-logs}"  # 网关文件日志目录。
+export LOG_MAX_FILE_MB="${LOG_MAX_FILE_MB:-200}"  # 单个 gateway.log 文件上限，MiB。
+export LOG_BACKUP_COUNT="${LOG_BACKUP_COUNT:-7}"  # 最多保留的大小轮转备份数。
+export LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"  # 启动时清理超过该天数的旧日志。
+export LOG_QUEUE_SIZE="${LOG_QUEUE_SIZE:-10000}"  # 异步日志队列容量；满时丢弃并上报计数。
 
+# ASR 模型下载：仅从 ModelScope 固定 revision 下载到独立本地目录。
+export VLLM_MODEL_ID="${VLLM_MODEL_ID:-Qwen/Qwen3-ASR-0.6B}"  # ModelScope 主模型仓库 ID。
+export VLLM_MODEL_DIR="${VLLM_MODEL_DIR:-models/qwen3-asr-0.6b/vllm}"  # 主模型持久化目录。
+export MODELSCOPE_REVISION="${MODELSCOPE_REVISION:-4ce9cc728b473a5aedbe7b6e1ea45646316824dc}"  # 固定提交 revision。
+
+# vLLM 引擎与调度：精度/权重格式、显存比例、token/序列预算、音频文件保护及启动超时。
+export DTYPE="${DTYPE:-bfloat16}"  # GPU 计算精度；A10 默认 bfloat16。
+export VLLM_LOAD_FORMAT="${VLLM_LOAD_FORMAT:-safetensors}"  # 本地权重加载格式。
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"  # GPU 显存占用比例，范围 (0,1)。
+export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-10240}"  # 单序列最大上下文 token 数。
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-128}"  # scheduler 最大活跃序列数，不是固定 batch。
+export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-10240}"  # 单轮调度 token 总预算。
+# vLLM 多模态加载器接受的单个音频剪辑文件上限，单位 MiB；它不限制整条网关请求时长。
+# 长音频通常已被网关切成最长 AUDIO_CHUNK_SECONDS 秒的独立 WAV，再逐片交给 vLLM。
+export VLLM_MAX_AUDIO_CLIP_FILESIZE_MB="${VLLM_MAX_AUDIO_CLIP_FILESIZE_MB:-96}"
+export VLLM_ATTENTION_BACKEND_NAME="${VLLM_ATTENTION_BACKEND_NAME:-FLASH_ATTN}"  # 多模态 attention 后端。
+export VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-600}"  # 等待 /health 就绪的总秒数。
+
+# 网关音频与请求限制。大小单位为 MiB，时长单位为秒，并发项单位为任务数。
+# Base64 约膨胀 1/3，因此 280 MiB JSON 请求体会先于同值的解码后音频上限触发。
+export AUDIO_CHUNK_SECONDS="${AUDIO_CHUNK_SECONDS:-32}"  # 长音频单个物理分片的最长秒数。
+export MAX_AUDIO_SECONDS="${MAX_AUDIO_SECONDS:-2000}"  # 解码后按采样帧计算的最大总秒数。
+export MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-280}"  # 解码后音频或 multipart 文件上限，MiB。
+export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-280}"  # 完整 Base64 JSON 请求体上限，MiB。
+export CHUNK_CONCURRENCY="${CHUNK_CONCURRENCY:-3}"  # 单个长请求最多并发提交的分片数。
+export LONG_CHUNKS_IN_FLIGHT="${LONG_CHUNKS_IN_FLIGHT:-96}"  # 全局长音频分片在途任务上限。
+export BACKEND_TIMEOUT="${BACKEND_TIMEOUT:-300}"  # 每个 vLLM 分片 HTTP 请求超时秒数。
+export ENABLE_VAD="${ENABLE_VAD:-false}"  # 预留开关；当前设为 true 会拒绝启动。
+
+# 动态热词：仅作为 Qwen3-ASR Prompt 软偏置，不保证强制命中。
+export ENABLE_HOTWORD="${ENABLE_HOTWORD:-true}"  # 是否将请求热词写入 Prompt。
+export MAX_HOTWORDS="${MAX_HOTWORDS:-100}"  # 去空去重后的最大热词数量。
+export MAX_HOTWORD_LENGTH="${MAX_HOTWORD_LENGTH:-64}"  # 单个热词最大 Unicode 字符数。
+export MAX_HOTWORD_CHARS="${MAX_HOTWORD_CHARS:-1000}"  # 全部热词最大 Unicode 字符总数。
+
+# ForcedAligner：两个开关分别控制字/词级 words 和按主模型标点聚合的句级 asr。
+# 单 A10 同卡试验保持 cuda:0、bfloat16、并发 1、batch 1；生产前必须验证显存与尾延迟。
+export ENABLE_WORD_TIMESTAMP="${ENABLE_WORD_TIMESTAMP:-true}"  # 是否返回真实字/词级 words。
+export ENABLE_SENTENCE_TIMESTAMP="${ENABLE_SENTENCE_TIMESTAMP:-true}"  # 是否按标点聚合真实句级边界。
+export ALIGNER_MODEL_ID="${ALIGNER_MODEL_ID:-Qwen/Qwen3-ForcedAligner-0.6B}"  # ModelScope Aligner 仓库 ID。
+export ALIGNER_MODEL_DIR="${ALIGNER_MODEL_DIR:-models/qwen3-forced-aligner-0.6b/pt}"  # Aligner 本地权重目录。
+export ALIGNER_MODELSCOPE_REVISION="${ALIGNER_MODELSCOPE_REVISION:-cf1c50164ea3ac48240d12bef5ead74aee0720cc}"  # 固定提交 revision。
+export ALIGNER_DEVICE="${ALIGNER_DEVICE:-cuda:0}"  # Aligner 执行设备，如 cuda:0 或 cpu。
+export ALIGNER_DTYPE="${ALIGNER_DTYPE:-bfloat16}"  # Aligner 精度；CPU 必须使用 float32。
+export ALIGNER_CONCURRENCY="${ALIGNER_CONCURRENCY:-1}"  # 同时进入 Aligner 的任务数。
+export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-1}"  # 单次模型调用包含的物理分片数。
+
+# 参数：待判断的布尔文本；true/1/yes/on（不区分大小写）视为开启。
+enabled() {
+  case "${1,,}" in
+    true|1|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if enabled "$ENABLE_WORD_TIMESTAMP" || enabled "$ENABLE_SENTENCE_TIMESTAMP"; then
+  if [[ "$ALIGNER_DEVICE" == "cuda:0" ]]; then
+    echo "警告：单卡双进程启用 ForcedAligner；vLLM 显存预算=$VLLM_GPU_MEMORY_UTILIZATION，Aligner=$ALIGNER_DEVICE/$ALIGNER_DTYPE。"
+    echo "该模式仅用于低流量试验；若 OOM，请降低 VLLM_GPU_MEMORY_UTILIZATION 或改用独立 GPU/CPU。"
+  fi
+fi
+
+# 参数：监听主机、端口、中文服务名；通过临时 bind 验证启动前端口未被占用。
 check_port_available() {
   local host="$1"
   local port="$2"
@@ -69,6 +123,17 @@ python scripts/download_model.py \
   --model-id "$VLLM_MODEL_ID" \
   --dir "$VLLM_MODEL_DIR" \
   --revision "$MODELSCOPE_REVISION"
+if enabled "$ENABLE_WORD_TIMESTAMP" || enabled "$ENABLE_SENTENCE_TIMESTAMP"; then
+  python -c 'import importlib.metadata as m; from qwen_asr import Qwen3ForcedAligner; assert m.version("qwen-asr") == "0.0.6"' || {
+    echo "时间戳功能已开启，但镜像未安装 qwen-asr==0.0.6。" >&2
+    echo "Docker 请使用 --build-arg INSTALL_ALIGNER=true 重新构建；本机环境请安装 requirements-aligner.txt。" >&2
+    exit 1
+  }
+  python scripts/download_model.py \
+    --model-id "$ALIGNER_MODEL_ID" \
+    --dir "$ALIGNER_MODEL_DIR" \
+    --revision "$ALIGNER_MODELSCOPE_REVISION"
+fi
 MODEL_DIR="$(python -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$VLLM_MODEL_DIR")"
 VLLM_PID=""
 GATEWAY_PID=""
@@ -87,7 +152,8 @@ trap 'exit 143' TERM
 echo "=== 启动 vLLM 后端 $VLLM_HOST:$VLLM_PORT（model=$MODEL_DIR）==="
 vllm serve "$MODEL_DIR" \
   --served-model-name "$SERVED_MODEL_NAME" --host "$VLLM_HOST" --port "$VLLM_PORT" \
-  --dtype "$DTYPE" --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION" \
+  --dtype "$DTYPE" --load-format "$VLLM_LOAD_FORMAT" \
+  --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION" \
   --max-model-len "$VLLM_MAX_MODEL_LEN" --max-num-seqs "$VLLM_MAX_NUM_SEQS" \
   --max-num-batched-tokens "$VLLM_MAX_NUM_BATCHED_TOKENS" \
   --attention-config.backend "$VLLM_ATTENTION_BACKEND_NAME" \
@@ -101,10 +167,15 @@ until python -c 'import sys,urllib.request; urllib.request.urlopen(sys.argv[1],t
 done
 
 echo "=== vLLM 已就绪，启动对外网关 $GATEWAY_HOST:$GATEWAY_PORT ==="
-python src/gateway.py &
+# 仅网关 stdout 恢复到容器原始 stdout，便于采集器按严格 JSON 解析。
+python src/gateway.py >&3 3>&- &
 GATEWAY_PID=$!
 set +e
 wait -n "$VLLM_PID" "$GATEWAY_PID"
 STATUS=$?
 set -e
 exit "$STATUS"
+
+
+#  docker run -it --gpus '"device=0"' --restart=always -p30960:8080 zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.16.0
+#  docker run -it --gpus '"device=1"' --restart=always -p30961:8080 zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.16.0
