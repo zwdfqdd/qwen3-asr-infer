@@ -5,9 +5,10 @@ import base64
 import binascii
 import io
 import json
-import sys
+import logging
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import aiohttp
@@ -15,9 +16,19 @@ import soundfile as sf
 from aiohttp import web
 
 try:
+    from .aligner import build_sentences, forced_aligner
     from .config import settings
+    from .logger import (
+        generate_request_id, log_event, logger, request_id_var,
+        setup_logger, shutdown_logging,
+    )
 except ImportError:  # 兼容 python src/gateway.py 直接执行。
+    from aligner import build_sentences, forced_aligner
     from config import settings
+    from logger import (
+        generate_request_id, log_event, logger, request_id_var,
+        setup_logger, shutdown_logging,
+    )
 
 
 class ErrorCode:
@@ -30,15 +41,23 @@ class ErrorCode:
     MODEL_LOAD_FAILED = (1006, "MODEL_LOAD_FAILED", 500)
     SERVICE_BUSY = (1007, "SERVICE_BUSY", 503)
     HOTWORD_VERSION_CONFLICT = (1008, "HOTWORD_VERSION_CONFLICT", 409)
+    ALIGNER_INFER_FAILED = (1009, "ALIGNER_INFER_FAILED", 500)
 
 
 class APIError(Exception):
+    """可转换为 HTTP 响应的业务异常。
+
+    ``definition`` 为 ``(业务码, 错误标识, 默认 HTTP 状态码)``；``message`` 为中文
+    客户端提示；``native_status`` 仅覆盖 multipart 原生接口的 HTTP 状态码。
+    """
+
     def __init__(
         self,
         definition: tuple[int, str, int],
         message: str,
         native_status: int | None = None,
     ):
+        """保存业务错误定义；``native_status`` 只覆盖非兼容接口的 HTTP 状态码。"""
         self.code, self.error, self.status = definition
         self.native_status = native_status or self.status
         self.message = message
@@ -47,11 +66,132 @@ class APIError(Exception):
 
 @dataclass
 class AudioChunk:
+    """一个物理音频分片。
+
+    ``audio`` 是待提交后端的完整文件字节；``filename``/``content_type`` 用于 HTTP 上传；
+    ``start``/``end`` 是该分片相对整条原音频的秒级边界。
+    """
+
     audio: bytes
     filename: str
     content_type: str
     start: float
     end: float
+
+
+@dataclass(frozen=True)
+class ASRChunkResult:
+    """单个物理分片的 ASR 结果；``language`` 为空表示模型未给出可靠语种标签。"""
+
+    text: str
+    language: str
+
+
+_ASR_LANGUAGES = {
+    "zh": "Chinese", "en": "English", "yue": "Cantonese", "ar": "Arabic",
+    "de": "German", "fr": "French", "es": "Spanish", "pt": "Portuguese",
+    "id": "Indonesian", "it": "Italian", "ko": "Korean", "ru": "Russian",
+    "th": "Thai", "vi": "Vietnamese", "ja": "Japanese", "tr": "Turkish",
+    "hi": "Hindi", "ms": "Malay", "nl": "Dutch", "sv": "Swedish",
+    "da": "Danish", "fi": "Finnish", "pl": "Polish", "cs": "Czech",
+    "fil": "Filipino", "fa": "Persian", "el": "Greek", "hu": "Hungarian",
+    "mk": "Macedonian", "ro": "Romanian",
+}
+_ASR_LANGUAGE_NAMES = {name.casefold(): (name, code) for code, name in _ASR_LANGUAGES.items()}
+_ASR_DIALECTS = (
+    "Anhui", "Dongbei", "Fujian", "Gansu", "Guizhou", "Hebei", "Henan",
+    "Hubei", "Hunan", "Jiangxi", "Ningxia", "Shandong", "Shaanxi",
+    "Shanxi", "Sichuan", "Tianjin", "Yunnan", "Zhejiang",
+    "Cantonese (Hong Kong accent)", "Cantonese (Guangdong accent)",
+    "Wu language", "Minnan language",
+)
+_MODEL_LANGUAGE_LABELS = {
+    **{name.casefold(): name for name in _ASR_LANGUAGES.values()},
+    **{name.casefold(): name for name in _ASR_DIALECTS},
+}
+_ASR_TEXT_TAG = "<asr_text>"
+_LOGGED_METHODS = {"GET", "POST"}
+_LOGGED_PATHS = {
+    "/chinese_asr", "/v1/audio/transcriptions", "/health", "/metrics", "/v1/models",
+}
+_LOGGED_MEDIA_TYPES = {
+    "application/json", "application/octet-stream", "audio/flac", "audio/mpeg",
+    "audio/ogg", "audio/wav", "audio/x-wav", "multipart/form-data",
+}
+
+
+def _logged_path(value: str) -> str:
+    """日志只保留固定路由，未知路径统一归类，避免路径携带秘密或放大日志。"""
+    return value if value in _LOGGED_PATHS else "<unmatched>"
+
+
+def _logged_media_type(value: str | None) -> str:
+    """媒体类型只记录允许值，不记录未受信任参数或扩展文本。"""
+    normalized = (value or "").split(";", 1)[0].strip().lower()
+    return normalized if normalized in _LOGGED_MEDIA_TYPES else "other"
+
+
+def _normalize_requested_language(value: Any) -> tuple[str, str] | None:
+    if value is None or not str(value).strip():
+        return None
+    raw = str(value).strip()
+    if raw.casefold() in _ASR_LANGUAGE_NAMES:
+        return _ASR_LANGUAGE_NAMES[raw.casefold()]
+    code = raw.lower()
+    if code in _ASR_LANGUAGES:
+        return _ASR_LANGUAGES[code], code
+    raise APIError(
+        ErrorCode.INPUT_PARAM_FAILED,
+        "language 仅支持 Qwen3-ASR 的 30 种可显式指定语言名称或 ISO 代码",
+    )
+
+
+def _canonical_model_language(value: str) -> str:
+    label = value.strip()
+    return _MODEL_LANGUAGE_LABELS.get(label.casefold(), label)
+
+
+def _log_language_label(value: str) -> str:
+    """日志仅保留官方语种标签；未知模型元数据统一记为 Other。"""
+    label = _canonical_model_language(value)
+    if not label:
+        return ""
+    if label.casefold() in _MODEL_LANGUAGE_LABELS:
+        return label
+    return "Other"
+
+
+def _parse_raw_asr_output(raw: str) -> ASRChunkResult:
+    value = raw.strip()
+    if not value:
+        return ASRChunkResult("", "")
+    if _ASR_TEXT_TAG not in value:
+        # 后端未返回结构化语言标签时保留文本，但不猜测语种。
+        return ASRChunkResult(value, "")
+    metadata, text = value.split(_ASR_TEXT_TAG, 1)
+    language = ""
+    for line in metadata.splitlines():
+        line = line.strip()
+        if line.lower().startswith("language "):
+            language = _canonical_model_language(line[len("language "):])
+            break
+    text = text.strip()
+    if language.casefold() == "none" and not text:
+        return ASRChunkResult("", "")
+    return ASRChunkResult(text, "" if language.casefold() == "none" else language)
+
+
+def _logged_chinese_asr_input(payload: Any) -> Any:
+    """复制业务输入供日志使用，并将音频 Base64 严格限制为前 64 个 ASCII 字节。"""
+    if not isinstance(payload, dict):
+        return payload
+    logged = dict(payload)
+    encoded = logged.get("base64")
+    if isinstance(encoded, str):
+        logged["base64"] = encoded.encode(
+            "ascii", errors="replace"
+        )[:64].decode("ascii")
+    return logged
 
 
 def _legacy_payload(article_url: str | None, **values) -> dict[str, Any]:
@@ -77,12 +217,67 @@ def _native_error_payload(message: str, code: str) -> dict[str, Any]:
 
 def _error_response(request: web.Request, error: APIError) -> web.Response:
     if request.path == "/chinese_asr":
-        return web.json_response(_error_payload(error), status=error.status, dumps=_json_dumps)
-    return web.json_response(
-        _native_error_payload(error.message, error.error),
-        status=error.native_status,
-        dumps=_json_dumps,
+        payload = _error_payload(error)
+        status = error.status
+    else:
+        payload = _native_error_payload(error.message, error.error)
+        status = error.native_status
+    request["log_fields"].update(
+        business_code=error.code,
+        error_code=error.error,
+        output_fields=list(payload),
     )
+    if request.path == "/chinese_asr":
+        request["log_fields"]["result_json"] = payload
+    return web.json_response(payload, status=status, dumps=_json_dumps)
+
+
+@web.middleware
+async def request_log_middleware(request: web.Request, handler):
+    """建立请求上下文，记录有界业务 JSON、统计摘要、结果分类与耗时。"""
+    request_id = generate_request_id(request.headers.get("X-Request-ID"))
+    token = request_id_var.set(request_id)
+    started = perf_counter()
+    request["log_fields"] = {
+        "method": request.method if request.method in _LOGGED_METHODS else "OTHER",
+        "path": _logged_path(request.path),
+        "content_type": _logged_media_type(request.content_type),
+        "content_length": request.content_length,
+        "input_fields": [],
+        "output_fields": [],
+    }
+    status = 500
+    outcome = "completed"
+    try:
+        response = await handler(request)
+        status = response.status
+        response.headers["X-Request-ID"] = request_id
+        body = getattr(response, "body", None)
+        if isinstance(body, (bytes, bytearray, memoryview)):
+            request["log_fields"]["response_bytes"] = len(body)
+        return response
+    except asyncio.CancelledError:
+        status = 499
+        outcome = "cancelled"
+        request["log_fields"].update(error_code="REQUEST_CANCELLED")
+        raise
+    except (ConnectionResetError, BrokenPipeError):
+        status = 499
+        outcome = "client_disconnected"
+        request["log_fields"].update(error_code="CLIENT_DISCONNECTED")
+        raise
+    finally:
+        fields = request["log_fields"]
+        fields.update(
+            status=status,
+            outcome=outcome,
+            request_latency_ms=round((perf_counter() - started) * 1000, 2),
+        )
+        level = logging.ERROR if status >= 500 else logging.WARNING if status >= 400 else logging.INFO
+        if request.path in {"/health", "/metrics", "/v1/models"} and status < 400:
+            level = logging.DEBUG
+        log_event(level, "http_request_completed", "HTTP 请求处理完成", **fields)
+        request_id_var.reset(token)
 
 
 @web.middleware
@@ -102,16 +297,38 @@ async def error_middleware(request: web.Request, handler):
                 else exception.text or "请求参数错误"
             )
             return _error_response(request, APIError(definition, message))
+        payload = _native_error_payload(
+            exception.text or exception.reason, exception.reason
+        )
+        request["log_fields"].update(
+            error_code=type(exception).__name__,
+            output_fields=list(payload),
+        )
         return web.json_response(
-            _native_error_payload(exception.text or exception.reason, exception.reason),
+            payload,
             status=exception.status,
             dumps=_json_dumps,
         )
     except asyncio.TimeoutError:
         error = APIError(ErrorCode.ASR_INFER_FAILED, "ASR 推理超时", native_status=504)
         return _error_response(request, error)
+    except (ConnectionResetError, BrokenPipeError):
+        request["log_fields"].update(error_code="CLIENT_DISCONNECTED")
+        raise
     except Exception as exception:  # noqa: BLE001
-        print(f"网关未处理异常: {type(exception).__name__}: {exception}", file=sys.stderr)
+        request["log_fields"].update(
+            business_code=ErrorCode.ASR_INFER_FAILED[0],
+            error_code=ErrorCode.ASR_INFER_FAILED[1],
+            exception_type=type(exception).__name__,
+        )
+        logger.error(
+            "网关未处理异常",
+            extra={
+                "event": "http_request_failed",
+                "extra_fields": request["log_fields"],
+            },
+            exc_info=True,
+        )
         error = APIError(ErrorCode.ASR_INFER_FAILED, "ASR 推理失败")
         return _error_response(request, error)
 
@@ -204,7 +421,12 @@ def _hotword_prompt(hotwords: list[str]) -> str | None:
     return "请准确识别音频中可能出现的专有名词：" + "、".join(hotwords) + "。"
 
 
-async def _post_chunk(app: web.Application, chunk: AudioChunk, fields: dict[str, str]) -> str:
+async def _post_transcription_chunk(
+    app: web.Application,
+    chunk: AudioChunk,
+    fields: dict[str, str],
+    language: str = "",
+) -> ASRChunkResult:
     form = aiohttp.FormData()
     form.add_field("file", chunk.audio, filename=chunk.filename,
                    content_type=chunk.content_type or "application/octet-stream")
@@ -238,7 +460,67 @@ async def _post_chunk(app: web.Application, chunk: AudioChunk, fields: dict[str,
                     "ASR 后端响应缺少文本",
                     native_status=502,
                 )
-            return text
+            return ASRChunkResult(text, language)
+    except aiohttp.ClientConnectionError as error:
+        raise APIError(
+            ErrorCode.MODEL_LOAD_FAILED,
+            "ASR 模型服务不可用",
+            native_status=502,
+        ) from error
+    except asyncio.TimeoutError as error:
+        raise APIError(
+            ErrorCode.ASR_INFER_FAILED,
+            "ASR 推理超时",
+            native_status=504,
+        ) from error
+
+
+async def _post_chat_chunk(
+    app: web.Application,
+    chunk: AudioChunk,
+    prompt: str | None,
+) -> ASRChunkResult:
+    audio_url = (
+        f"data:{chunk.content_type or 'application/octet-stream'};base64,"
+        + base64.b64encode(chunk.audio).decode("ascii")
+    )
+    messages: list[dict[str, Any]] = []
+    if prompt:
+        messages.append({"role": "system", "content": prompt})
+    messages.append({
+        "role": "user",
+        "content": [{"type": "audio_url", "audio_url": {"url": audio_url}}],
+    })
+    request_body = {
+        "model": settings.served_model_name,
+        "messages": messages,
+        "temperature": 0,
+    }
+    try:
+        async with app["session"].post(
+            f"{settings.backend_url}/v1/chat/completions", json=request_body
+        ) as response:
+            body = await response.text()
+            if response.status in (429, 503):
+                raise APIError(ErrorCode.SERVICE_BUSY, "服务繁忙，请稍后重试")
+            if response.status != 200:
+                raise APIError(ErrorCode.ASR_INFER_FAILED, "ASR 推理失败", native_status=502)
+            try:
+                payload = json.loads(body)
+                content = payload["choices"][0]["message"]["content"]
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+                raise APIError(
+                    ErrorCode.ASR_INFER_FAILED,
+                    "ASR 后端响应缺少原始文本",
+                    native_status=502,
+                ) from error
+            if not isinstance(content, str):
+                raise APIError(
+                    ErrorCode.ASR_INFER_FAILED,
+                    "ASR 后端原始文本类型异常",
+                    native_status=502,
+                )
+            return _parse_raw_asr_output(content)
     except aiohttp.ClientConnectionError as error:
         raise APIError(
             ErrorCode.MODEL_LOAD_FAILED,
@@ -254,17 +536,78 @@ async def _post_chunk(app: web.Application, chunk: AudioChunk, fields: dict[str,
 
 
 async def _recognize_chunks(
-    app: web.Application, chunks: list[AudioChunk], fields: dict[str, str]
-) -> list[str]:
-    if len(chunks) == 1:
-        return [await _post_chunk(app, chunks[0], fields)]
+    app: web.Application,
+    chunks: list[AudioChunk],
+    fields: dict[str, str],
+    requested_language: tuple[str, str] | None = None,
+    prompt: str | None = None,
+    detect_language: bool = True,
+) -> list[ASRChunkResult]:
+    """并发识别物理分片并保持输入顺序。
+
+    ``fields`` 是转写端点 multipart 字段；``requested_language`` 为规范语言名和 ISO 代码；
+    ``prompt`` 是热词软提示；``detect_language`` 为 true 且未强制语言时改走 Chat API，
+    以保留模型原始语种标签。长音频同时受单请求和全局两个信号量限制。
+    """
+    if detect_language and requested_language is None:
+        backend_api = "chat"
+        post = lambda chunk: _post_chat_chunk(app, chunk, prompt)
+    elif requested_language is not None:
+        backend_api = "transcriptions"
+        language_name, language_code = requested_language
+        transcription_fields = dict(fields)
+        transcription_fields["to_language"] = language_code
+        if prompt:
+            transcription_fields["prompt"] = prompt
+        post = lambda chunk: _post_transcription_chunk(
+            app, chunk, transcription_fields, language_name
+        )
+    else:
+        backend_api = "transcriptions"
+        post = lambda chunk: _post_transcription_chunk(app, chunk, fields)
+
     local_slots = asyncio.Semaphore(settings.chunk_concurrency)
 
-    async def limited(chunk: AudioChunk) -> str:
-        async with local_slots, app["long_chunk_slots"]:
-            return await _post_chunk(app, chunk, fields)
+    async def run_chunk(index: int, chunk: AudioChunk) -> ASRChunkResult:
+        started = perf_counter()
+        try:
+            if len(chunks) == 1:
+                result = await post(chunk)
+            else:
+                async with local_slots, app["long_chunk_slots"]:
+                    result = await post(chunk)
+        except Exception as error:
+            log_event(
+                logging.WARNING,
+                "backend_chunk_failed",
+                "ASR 后端分片失败",
+                backend_api=backend_api,
+                chunk_index=index,
+                chunk_start_ms=round(chunk.start * 1000),
+                chunk_end_ms=round(chunk.end * 1000),
+                chunk_audio_bytes=len(chunk.audio),
+                backend_latency_ms=round((perf_counter() - started) * 1000, 2),
+                exception_type=type(error).__name__,
+            )
+            raise
+        log_event(
+            logging.DEBUG,
+            "backend_chunk_completed",
+            "ASR 后端分片完成",
+            backend_api=backend_api,
+            chunk_index=index,
+            chunk_start_ms=round(chunk.start * 1000),
+            chunk_end_ms=round(chunk.end * 1000),
+            chunk_audio_bytes=len(chunk.audio),
+            backend_latency_ms=round((perf_counter() - started) * 1000, 2),
+            result_chars=len(result.text),
+            language=_log_language_label(result.language),
+        )
+        return result
 
-    return await asyncio.gather(*(limited(chunk) for chunk in chunks))
+    return await asyncio.gather(*(
+        run_chunk(index, chunk) for index, chunk in enumerate(chunks)
+    ))
 
 
 async def transcribe(request: web.Request) -> web.Response:
@@ -293,8 +636,31 @@ async def transcribe(request: web.Request) -> web.Response:
     chunks = _split_audio(audio, filename)
     if len(chunks) == 1:
         chunks[0].content_type = content_type
-    texts = await _recognize_chunks(request.app, chunks, fields)
-    return web.json_response({"text": _merge_text(texts)},
+    request["log_fields"].update(
+        input_fields=[
+            name for name in ("file", "model", "response_format", "language", "prompt")
+            if name == "file" or name in fields
+        ],
+        audio_bytes=len(audio),
+        audio_duration_ms=round(chunks[-1].end * 1000),
+        chunk_count=len(chunks),
+        audio_content_type=_logged_media_type(content_type),
+        language_mode="explicit" if fields.get("language") else "auto",
+        requested_language_present=bool(fields.get("language")),
+        prompt_present=bool(fields.get("prompt")),
+    )
+    results = await _recognize_chunks(
+        request.app, chunks, fields, detect_language=False
+    )
+    texts = [result.text for result in results]
+    merged_text = _merge_text(texts)
+    output = {"text": merged_text}
+    request["log_fields"].update(
+        output_fields=list(output),
+        result_chars=len(merged_text),
+        output_chunk_count=len(results),
+    )
+    return web.json_response(output,
                              headers={"X-Audio-Chunks": str(len(chunks))},
                              dumps=_json_dumps)
 
@@ -306,6 +672,7 @@ async def chinese_asr(request: web.Request) -> web.Response:
         payload = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise APIError(ErrorCode.INPUT_PARAM_FAILED, "请求 JSON 格式错误") from error
+    request["log_fields"]["input_json"] = _logged_chinese_asr_input(payload)
     if not isinstance(payload, dict):
         raise APIError(ErrorCode.INPUT_PARAM_FAILED, "请求体必须是 JSON 对象")
     encoded = payload.get("base64")
@@ -315,6 +682,10 @@ async def chinese_asr(request: web.Request) -> web.Response:
     if article_url is not None and not isinstance(article_url, str):
         raise APIError(ErrorCode.INPUT_PARAM_FAILED, "article_url 必须是字符串或 null")
     hotwords = _normalize_hotwords(payload.get("hotwords"))
+    language_value = payload.get("language")
+    if language_value is not None and not isinstance(language_value, str):
+        raise APIError(ErrorCode.INPUT_PARAM_FAILED, "language 必须是字符串或 null")
+    requested_language = _normalize_requested_language(language_value)
     try:
         audio = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as error:
@@ -324,27 +695,132 @@ async def chinese_asr(request: web.Request) -> web.Response:
     if len(audio) > settings.max_upload_mb * 1024**2:
         raise APIError(ErrorCode.AUDIO_TOO_LONG, "音频文件超过大小限制")
     chunks = _split_audio(audio, "audio.wav")
+    request["log_fields"].update(
+        input_fields=[
+            name for name in ("base64", "article_url", "hotwords", "language")
+            if name in payload
+        ],
+        base64_encoded_chars=len(encoded),
+        audio_bytes=len(audio),
+        audio_duration_ms=round(chunks[-1].end * 1000),
+        chunk_count=len(chunks),
+        language_mode="explicit" if requested_language else "auto",
+        requested_language=requested_language[0] if requested_language else "",
+        hotword_count=len(hotwords),
+        hotword_chars=sum(map(len, hotwords)),
+        article_url_present=article_url is not None,
+    )
     fields = {
         "model": settings.served_model_name,
         "response_format": "json",
-        "temperature": "0",
     }
-    if prompt := _hotword_prompt(hotwords):
-        fields["prompt"] = prompt
-    texts = await _recognize_chunks(request.app, chunks, fields)
+    prompt = _hotword_prompt(hotwords)
+    results = await _recognize_chunks(
+        request.app,
+        chunks,
+        fields,
+        requested_language=requested_language,
+        prompt=prompt,
+    )
+    texts = [result.text for result in results]
+    languages = [result.language for result in results]
+    aligner_started = perf_counter()
+    try:
+        alignment = await forced_aligner.align_chunks(chunks, texts, languages)
+    except (asyncio.TimeoutError, RuntimeError, ValueError) as error:
+        log_event(
+            logging.ERROR,
+            "aligner_failed",
+            "ForcedAligner 对齐失败",
+            chunk_count=len(chunks),
+            aligner_latency_ms=round((perf_counter() - aligner_started) * 1000, 2),
+            exception_type=type(error).__name__,
+        )
+        raise APIError(ErrorCode.ALIGNER_INFER_FAILED, "时间戳对齐失败") from error
+    aligned = alignment.units
+    skipped_indices = {item.chunk_index for item in alignment.skipped}
+    skipped_languages = sorted({
+        _log_language_label(item.language) or "Unknown"
+        for item in alignment.skipped
+    })
+    if settings.timestamp_enabled:
+        log_event(
+            logging.INFO,
+            "aligner_completed",
+            "ForcedAligner 对齐完成",
+            chunk_count=len(chunks),
+            aligner_latency_ms=round((perf_counter() - aligner_started) * 1000, 2),
+            aligned_unit_count=sum(map(len, aligned)),
+            skipped_count=len(alignment.skipped),
+            skipped_indices=sorted(skipped_indices),
+            skipped_languages=skipped_languages,
+        )
+    warning = ""
+    if alignment.skipped:
+        details = ", ".join(
+            f"分片 {item.chunk_index}={item.language or '未知'}"
+            for item in alignment.skipped
+        )
+        warning = f"部分分片语种不受 ForcedAligner 支持，已跳过真实对齐：{details}"
+        log_event(
+            logging.WARNING,
+            "aligner_chunks_skipped",
+            "部分分片跳过真实对齐",
+            skipped_count=len(alignment.skipped),
+            skipped_indices=sorted(skipped_indices),
+            skipped_languages=skipped_languages,
+        )
     segments = [
         {
             "idx": index,
-            "slid": "",
-            "text": text,
+            "slid": result.language,
+            "text": result.text,
             "speaker": "",
             "timestamp": [round(chunk.start, 3), round(chunk.end, 3)],
-            "words": [],
+            "words": [
+                {
+                    "text": unit.text,
+                    "timestamp": [round(unit.start, 3), round(unit.end, 3)],
+                }
+                for unit in aligned[index]
+            ] if settings.enable_word_timestamp else [],
         }
-        for index, (chunk, text) in enumerate(zip(chunks, texts))
+        for index, (chunk, result) in enumerate(zip(chunks, results))
     ]
+    merged_text = _merge_text(texts)
+    if settings.enable_sentence_timestamp and not skipped_indices:
+        try:
+            segments = build_sentences(
+                merged_text,
+                [unit for chunk_units in aligned for unit in chunk_units],
+            )
+        except ValueError as error:
+            raise APIError(ErrorCode.ALIGNER_INFER_FAILED, "句级时间戳生成失败") from error
+    elif settings.enable_sentence_timestamp and skipped_indices:
+        suffix = "；句级聚合已禁用，响应保留物理分片边界"
+        warning = f"{warning}{suffix}"
+    output = _legacy_payload(
+        article_url,
+        istar_asr=merged_text,
+        asr=segments,
+        message=warning,
+    )
+    request["log_fields"].update(
+        business_code=0,
+        output_fields=list(output),
+        result_json=output,
+        result_chars=len(merged_text),
+        segment_count=len(segments),
+        word_unit_count=sum(len(segment["words"]) for segment in segments),
+        result_languages=sorted({
+            label for language in languages
+            if (label := _log_language_label(language))
+        }),
+        alignment_skipped_count=len(alignment.skipped),
+        warning_present=bool(warning),
+    )
     return web.json_response(
-        _legacy_payload(article_url, istar_asr=_merge_text(texts), asr=segments),
+        output,
         headers={"X-Audio-Chunks": str(len(chunks))}, dumps=_json_dumps,
     )
 
@@ -363,34 +839,102 @@ async def health(request: web.Request) -> web.Response:
             "status": "ok",
             "version": settings.service_version,
             "model": settings.served_model_name,
+            "timestamps": settings.timestamp_enabled,
+            "aligner_device": settings.aligner_device if settings.timestamp_enabled else None,
         },
         dumps=_json_dumps,
     )
 
 
 async def proxy_get(request: web.Request) -> web.Response:
-    async with request.app["session"].get(
-        f"{settings.backend_url}{request.path}"
-    ) as response:
-        body = await response.read()
-        headers = {}
-        if content_type := response.headers.get("Content-Type"):
-            headers["Content-Type"] = content_type
-        return web.Response(body=body, status=response.status, headers=headers)
+    try:
+        async with request.app["session"].get(
+            f"{settings.backend_url}{request.path}"
+        ) as response:
+            body = await response.read()
+            request["log_fields"].update(
+                upstream_status=response.status,
+                upstream_response_bytes=len(body),
+            )
+            if response.status >= 400:
+                request["log_fields"]["error_code"] = f"UPSTREAM_HTTP_{response.status}"
+            headers = {}
+            if content_type := response.headers.get("Content-Type"):
+                headers["Content-Type"] = content_type
+            return web.Response(body=body, status=response.status, headers=headers)
+    except asyncio.TimeoutError as error:
+        request["log_fields"].update(error_code="UPSTREAM_TIMEOUT")
+        raise web.HTTPGatewayTimeout(text="vLLM 后端请求超时") from error
+    except aiohttp.ClientError as error:
+        request["log_fields"].update(error_code="UPSTREAM_UNAVAILABLE")
+        raise web.HTTPBadGateway(text="vLLM 后端不可用") from error
 
 
 async def _session_context(app: web.Application):
-    timeout = aiohttp.ClientTimeout(total=settings.backend_timeout)
-    app["session"] = aiohttp.ClientSession(timeout=timeout)
-    app["long_chunk_slots"] = asyncio.Semaphore(settings.long_chunks_in_flight)
-    yield
-    await app["session"].close()
+    setup_logger()
+    log_event(
+        logging.INFO,
+        "gateway_starting",
+        "网关开始初始化",
+        service_version=settings.service_version,
+        served_model_name=settings.served_model_name,
+        gateway_host=settings.gateway_host,
+        gateway_port=settings.gateway_port,
+        timestamp_enabled=settings.timestamp_enabled,
+        log_level=settings.log_level,
+        log_file_enabled=settings.log_file_enabled,
+        log_max_file_mb=settings.log_max_file_mb,
+        log_backup_count=settings.log_backup_count,
+        log_retention_days=settings.log_retention_days,
+        log_queue_size=settings.log_queue_size,
+    )
+    session: aiohttp.ClientSession | None = None
+    started = False
+    try:
+        forced_aligner.load()
+        timeout = aiohttp.ClientTimeout(total=settings.backend_timeout)
+        session = aiohttp.ClientSession(timeout=timeout)
+        app["session"] = session
+        app["long_chunk_slots"] = asyncio.Semaphore(settings.long_chunks_in_flight)
+        started = True
+        log_event(
+            logging.INFO,
+            "gateway_started",
+            "网关初始化完成",
+            service_version=settings.service_version,
+            served_model_name=settings.served_model_name,
+            timestamp_enabled=settings.timestamp_enabled,
+        )
+        yield
+    except Exception:  # noqa: BLE001 - 启动失败必须记录堆栈后继续抛出。
+        logger.error(
+            "网关初始化或清理失败",
+            extra={
+                "event": "gateway_lifecycle_failed",
+                "extra_fields": {"started": started},
+            },
+            exc_info=True,
+        )
+        raise
+    finally:
+        try:
+            if session is not None and not session.closed:
+                await session.close()
+        finally:
+            log_event(
+                logging.INFO,
+                "gateway_stopped",
+                "网关已停止",
+                service_version=settings.service_version,
+                started=started,
+            )
+            shutdown_logging()
 
 
 def create_app() -> web.Application:
     app = web.Application(
         client_max_size=settings.max_json_body_mb * 1024**2,
-        middlewares=[error_middleware],
+        middlewares=[request_log_middleware, error_middleware],
     )
     app.cleanup_ctx.append(_session_context)
     app.router.add_post("/chinese_asr", chinese_asr)

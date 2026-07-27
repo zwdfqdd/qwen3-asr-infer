@@ -1,0 +1,7 @@
+# ForcedAligner 可选依赖；不要安装 qwen-asr[vllm]，其 extra 固定 vLLM 0.14.0。
+-r requirements-infer.txt
+# qwen-asr 间接依赖 Flask；容器会先用 --ignore-installed 覆盖基础镜像的 distutils blinker 1.4。
+blinker==1.9.0
+qwen-asr==0.0.6
+# qwen-asr 0.0.6 已精确约束 transformers/nagisa/soynlp/accelerate；其余传递依赖
+# 由该发布包解析，目标 Linux/CUDA 环境必须执行 python -m pip check。
