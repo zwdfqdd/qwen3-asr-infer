@@ -1,0 +1,11 @@
+.git
+.kiro
+.idea
+.vscode
+.tmp-*
+.venv
+venv
+__pycache__
+*.py[cod]
+*.log
+docs
