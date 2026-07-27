@@ -16,7 +16,7 @@ if [[ -n "${PORT:-}" ]]; then
   unset PORT
 fi
 # 服务元数据与端口：8080 是唯一对外端口，8081 仅供本机网关访问。
-export SERVICE_VERSION="${SERVICE_VERSION:-1.1.0}"  # /health 返回的版本字符串。
+export SERVICE_VERSION="${SERVICE_VERSION:-2.0.0}"  # /health 返回的版本字符串。
 export VLLM_PORT="${VLLM_PORT:-8081}"  # vLLM 内部监听端口，范围 1～65535。
 export VLLM_HOST="${VLLM_HOST:-127.0.0.1}"  # vLLM 监听地址；默认禁止外部绕过网关。
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-asr}"  # vLLM 对外模型别名。

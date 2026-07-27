@@ -79,7 +79,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         result = cls(
-            service_version=os.getenv("SERVICE_VERSION", "1.1.0").strip(),
+            service_version=os.getenv("SERVICE_VERSION", "2.0.0").strip(),
             backend_url=os.getenv("BACKEND_URL", "http://127.0.0.1:8081").rstrip("/"),
             served_model_name=os.getenv("SERVED_MODEL_NAME", "qwen3-asr").strip(),
             gateway_host=os.getenv("GATEWAY_HOST", "0.0.0.0").strip(),

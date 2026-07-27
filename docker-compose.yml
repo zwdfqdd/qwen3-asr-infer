@@ -27,7 +27,7 @@ services:
 
     environment:
       # 服务元数据与端口；vLLM 8081 仅监听容器回环地址。
-      SERVICE_VERSION: "${SERVICE_VERSION:-1.1.0}"
+      SERVICE_VERSION: "${SERVICE_VERSION:-2.0.0}"
       VLLM_HOST: "127.0.0.1"
       VLLM_PORT: "8081"
       GATEWAY_HOST: "0.0.0.0"

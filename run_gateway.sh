@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
 # 服务元数据与路由；该调试入口不启动 vLLM，也不下载模型。
-export SERVICE_VERSION="${SERVICE_VERSION:-1.1.0}"  # /health 返回的版本字符串。
+export SERVICE_VERSION="${SERVICE_VERSION:-2.0.0}"  # /health 返回的版本字符串。
 export GATEWAY_HOST="${GATEWAY_HOST:-0.0.0.0}"  # aiohttp 网关监听地址。
 export GATEWAY_PORT="${GATEWAY_PORT:-8080}"  # 客户端访问的网关端口。
 export VLLM_PORT="${VLLM_PORT:-8081}"  # 已独立启动的 vLLM 端口。

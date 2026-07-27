@@ -1,4 +1,4 @@
-# API 文档（v1.1.0）
+# API 文档（v2.0.0）
 
 对外基址默认 `http://<host>:8080`。所有时间单位为秒，JSON 使用 UTF-8。
 
@@ -179,13 +179,13 @@ ForcedAligner 推理失败、返回异常或句级结果无法可靠映射时，
 |---:|---|---:|---|
 | 1000 | `INPUT_PARAM_FAILED` | 400 | Content-Type、JSON、必填字段或字段类型错误 |
 | 1001 | `DECODE_FAILED` | 400 | Base64 非法、容器不可解码、零帧或采样率无效 |
-| 1002 | `VAD_SEGMENT_ERROR` | 500 | 保留码；v1.1.0 未实现 VAD |
+| 1002 | `VAD_SEGMENT_ERROR` | 500 | 保留码；v2.0.0 未实现 VAD |
 | 1003 | `AUDIO_SEGMENT_ERROR` | 500 | 长音频重编码或切分结果异常 |
 | 1004 | `ASR_INFER_FAILED` | 500 | 后端推理失败、超时或响应结构异常 |
 | 1005 | `AUDIO_TOO_LONG` | 400 | 音频时长、音频文件或 JSON 请求体超过限制 |
 | 1006 | `MODEL_LOAD_FAILED` | 500 | 无法连接 vLLM 后端 |
 | 1007 | `SERVICE_BUSY` | 503 | vLLM 返回 429 或 503 |
-| 1008 | `HOTWORD_VERSION_CONFLICT` | 409 | 保留码；v1.1.0 无版本化词表 |
+| 1008 | `HOTWORD_VERSION_CONFLICT` | 409 | 保留码；v2.0.0 无版本化词表 |
 | 1009 | `ALIGNER_INFER_FAILED` | 500 | Aligner 实际推理失败、返回结构异常或句级结果无法可靠映射；可预判的不支持语种使用 HTTP 200 部分对齐契约 |
 
 错误时 `article_url` 固定为 `null`，不会回显请求中的来源标识。零字节、零帧和无效音频均为
@@ -240,7 +240,7 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 ## 3. 管理端点
 
 - `GET /health`：同时检查网关与后端，成功返回
-  `{"status":"ok","version":"1.1.0","model":"qwen3-asr","timestamps":true,"aligner_device":"cuda:0"}`；
+  `{"status":"ok","version":"2.0.0","model":"qwen3-asr","timestamps":true,"aligner_device":"cuda:0"}`；
   时间戳关闭时 `timestamps=false`、`aligner_device=null`，后端不可用返回 503。
 - `GET /metrics`：透明代理 vLLM Prometheus 文本。
 - `GET /v1/models`：透明代理 vLLM 模型列表。
