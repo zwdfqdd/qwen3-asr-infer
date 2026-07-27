@@ -143,17 +143,19 @@ async def _load_audio(session, source: str) -> tuple[bytes, str, str]:
 async def _transcribe(session, args, source):
     audio, filename, content_type = await _load_audio(session, source)
     if args.api_mode == "chinese-asr":
-        request_kwargs = {"json": {
+        result = {
             "base64": base64.b64encode(audio).decode("ascii"),
             "article_url": source,
             "hotwords": args.hotword or None,
-        }}
+        }
+        if args.language:
+            result["language"] = args.language
+        request_kwargs = {"json": result}
     else:
         form = aiohttp.FormData()
         form.add_field("file", audio, filename=filename, content_type=content_type)
         form.add_field("model", args.model)
         form.add_field("response_format", "json")
-        form.add_field("temperature", "0")
         if args.language:
             form.add_field("language", args.language)
         request_kwargs = {"data": form}
@@ -222,17 +224,26 @@ async def _run(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen3-ASR API推理与CER验证")
-    parser.add_argument("--api-mode", choices=("native", "chinese-asr"), default="native")
-    parser.add_argument("--url", default=None)
-    parser.add_argument("--model", default=os.getenv("SERVED_MODEL_NAME", "qwen3-asr"))
+    parser.add_argument(
+        "--api-mode", choices=("native", "chinese-asr"), default="native",
+        help="接口模式：native=multipart，chinese-asr=Base64 JSON",
+    )
+    parser.add_argument("--url", default=None, help="请求地址；缺省时根据 --api-mode 自动选择")
+    parser.add_argument(
+        "--model", default=os.getenv("SERVED_MODEL_NAME", "qwen3-asr"),
+        help="multipart 请求模型名；默认读取 SERVED_MODEL_NAME",
+    )
     parser.add_argument("--hotword", action="append", default=[], help="兼容接口动态热词，可重复")
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--ref", default=None, help="参考目录、单条.txt或JSONL文件")
+    parser.add_argument("--input", required=True, help="音频 URL、本地音频文件或音频目录")
+    parser.add_argument("--ref", default=None, help="参考目录、单条 .txt 或 JSONL 文件")
     parser.add_argument("--ref-text", default=None, help="单音频直接参考文本")
-    parser.add_argument("--language", default="")
-    parser.add_argument("--baseline-cer", type=float, default=None)
-    parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--language", default="", help="可选强制语种；留空时由模型自动检测")
+    parser.add_argument(
+        "--baseline-cer", type=float, default=None,
+        help="加权总体 CER 门禁上限，范围 0～1；不传时只报告",
+    )
+    parser.add_argument("--limit", type=int, default=0, help="最多处理的音频数；0 表示不限制")
+    parser.add_argument("--timeout", type=float, default=300, help="每个 HTTP 请求总超时，单位秒")
     args = parser.parse_args()
     if args.baseline_cer is not None and not 0 <= args.baseline_cer <= 1:
         parser.error("--baseline-cer 必须在 0～1 之间")

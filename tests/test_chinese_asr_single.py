@@ -49,10 +49,24 @@ def _validate_response(body: dict, article_url: str | None) -> None:
         start, end = timestamp
         if start < previous_end or end < start:
             raise RuntimeError(f"asr[{index}].timestamp 非单调")
+        if not isinstance(segment.get("slid"), str):
+            raise RuntimeError(f"asr[{index}].slid 不是字符串")
         if not isinstance(segment.get("text"), str):
             raise RuntimeError(f"asr[{index}].text 不是字符串")
-        if segment.get("words") != []:
-            raise RuntimeError(f"asr[{index}].words 当前应为空数组")
+        words = segment.get("words")
+        if not isinstance(words, list):
+            raise RuntimeError(f"asr[{index}].words 不是数组")
+        word_end = start
+        for word_index, word in enumerate(words):
+            word_timestamp = word.get("timestamp")
+            if (not isinstance(word.get("text"), str)
+                    or not isinstance(word_timestamp, list)
+                    or len(word_timestamp) != 2):
+                raise RuntimeError(f"asr[{index}].words[{word_index}] 格式错误")
+            word_start, word_stop = word_timestamp
+            if word_start < word_end or word_stop < word_start:
+                raise RuntimeError(f"asr[{index}].words[{word_index}] 时间戳非单调")
+            word_end = word_stop
         previous_end = end
 
 
@@ -64,6 +78,7 @@ async def _run(args) -> int:
         "base64": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
         "article_url": args.article_url,
         "hotwords": args.hotword or None,
+        "language": args.language or None,
     }
     timeout = aiohttp.ClientTimeout(total=args.timeout)
     started = asyncio.get_running_loop().time()
@@ -86,8 +101,8 @@ async def _run(args) -> int:
                 chunks = int(raw_chunks or "")
             except ValueError as error:
                 raise RuntimeError("响应缺少有效 X-Audio-Chunks") from error
-            if chunks < 1 or chunks != len(body["asr"]):
-                raise RuntimeError("分片响应头必须为正整数且与 asr[] 数量一致")
+            if chunks < 1:
+                raise RuntimeError("X-Audio-Chunks 必须为正整数")
     print(f"HTTP 200  耗时: {elapsed:.3f}s  分片数: {chunks}")
     print(json.dumps(body, ensure_ascii=False, indent=2))
     return 0
@@ -95,11 +110,18 @@ async def _run(args) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description="单条测试 /chinese_asr Base64 JSON接口")
-    parser.add_argument("--audio", required=True, help="本地音频文件")
-    parser.add_argument("--url", default="http://127.0.0.1:8080/chinese_asr")
+    parser.add_argument("--audio", required=True, help="待识别的本地音频文件路径")
+    parser.add_argument(
+        "--url", default="http://127.0.0.1:8080/chinese_asr",
+        help="/chinese_asr 完整请求地址",
+    )
     parser.add_argument("--article-url", default=None, help="仅作为来源标识原样返回")
     parser.add_argument("--hotword", action="append", default=[], help="动态热词，可重复传入")
-    parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument(
+        "--language", default="",
+        help="可选 ASR 强制语种，如 Chinese/zh、English/en；留空时自动检测",
+    )
+    parser.add_argument("--timeout", type=float, default=300, help="单次 HTTP 请求总超时，单位秒")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout必须大于0")

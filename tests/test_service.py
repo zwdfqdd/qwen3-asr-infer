@@ -23,6 +23,8 @@ except ImportError:  # 资源采样是可选能力，不应阻断接口压测。
 
 @dataclass
 class Result:
+    """单次压测结果：延迟单位秒，分片数来自 X-Audio-Chunks，文本长度按字符计。"""
+
     latency: float
     status: int | None
     chunks: int | None = None
@@ -32,6 +34,8 @@ class Result:
 
 @dataclass
 class ResourceStats:
+    """周期采样值：GPU/CPU 利用率单位百分比，GPU 显存单位 MiB。"""
+
     gpu_utilization: list[float] = field(default_factory=list)
     gpu_memory_mib: list[float] = field(default_factory=list)
     cpu_utilization: list[float] = field(default_factory=list)
@@ -103,13 +107,14 @@ async def _request(session, args, audio: bytes, filename: str, content_type: str
             "article_url": args.article_url,
             "hotwords": args.hotword or None,
         }
+        if args.language:
+            request_data["language"] = args.language
         request_kwargs = {"json": request_data}
     else:
         form = aiohttp.FormData()
         form.add_field("file", audio, filename=filename, content_type=content_type)
         form.add_field("model", args.model)
         form.add_field("response_format", "json")
-        form.add_field("temperature", "0")
         if args.language:
             form.add_field("language", args.language)
         request_kwargs = {"data": form}
@@ -272,23 +277,32 @@ async def _run(args) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description="Qwen3-ASR网关并发性能测试")
-    parser.add_argument("--audio", required=True, help="本地音频文件")
-    parser.add_argument("--api-mode", choices=("native", "chinese-asr"), default="native")
+    parser.add_argument("--audio", required=True, help="每个请求重复使用的本地音频文件路径")
+    parser.add_argument(
+        "--api-mode", choices=("native", "chinese-asr"), default="native",
+        help="接口模式：native=multipart，chinese-asr=Base64 JSON",
+    )
     parser.add_argument("--hotword", action="append", default=[], help="兼容接口动态热词，可重复")
     parser.add_argument("--article-url", default=None, help="兼容接口原样返回的来源标识")
-    parser.add_argument("--url", default=None)
-    parser.add_argument("--health-url", default="http://127.0.0.1:8080/health")
-    parser.add_argument("--model", default=os.getenv("SERVED_MODEL_NAME", "qwen3-asr"))
-    parser.add_argument("--language", default="")
-    parser.add_argument("--concurrency", type=int, default=96)
-    parser.add_argument("--total", type=int, default=2000)
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--timeout", type=float, default=300)
-    parser.add_argument("--sample-interval", type=float, default=0.5)
-    parser.add_argument("--gpu-index", type=int, default=0)
+    parser.add_argument("--url", default=None, help="压测地址；缺省时根据 --api-mode 自动选择")
     parser.add_argument(
-        "--chunk-seconds", type=float, default=30,
-        help="仅用于计算网关预期分片数，需与AUDIO_CHUNK_SECONDS一致",
+        "--health-url", default="http://127.0.0.1:8080/health",
+        help="压测前检查的健康端点地址",
+    )
+    parser.add_argument(
+        "--model", default=os.getenv("SERVED_MODEL_NAME", "qwen3-asr"),
+        help="multipart 请求模型名；默认读取 SERVED_MODEL_NAME",
+    )
+    parser.add_argument("--language", default="", help="可选强制语种；留空时由模型自动检测")
+    parser.add_argument("--concurrency", type=int, default=96, help="客户端最大并发请求数")
+    parser.add_argument("--total", type=int, default=2000, help="正式压测请求总数")
+    parser.add_argument("--warmup", type=int, default=3, help="正式计时前串行预热请求数")
+    parser.add_argument("--timeout", type=float, default=300, help="每个 HTTP 请求总超时，单位秒")
+    parser.add_argument("--sample-interval", type=float, default=0.5, help="资源采样间隔，单位秒")
+    parser.add_argument("--gpu-index", type=int, default=0, help="nvidia-smi 采样的宿主 GPU 索引")
+    parser.add_argument(
+        "--chunk-seconds", type=float, default=32,
+        help="网关单片秒数，仅用于计算预期分片数；需与 AUDIO_CHUNK_SECONDS 一致",
     )
     args = parser.parse_args()
     if args.url is None:
