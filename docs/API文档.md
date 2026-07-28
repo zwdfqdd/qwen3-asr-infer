@@ -17,6 +17,27 @@ HTTP 解析阶段即被拒绝、客户端提前断开、请求被取消或进程
 截断。日志包含热词、`article_url` 和识别文本等业务内容，应按敏感数据限制访问和保留周期；
 音频二进制、multipart 文件名和后端 Prompt 仍不落日志。
 
+所有能够形成 HTTP 响应的请求还会返回 `Server-Timing`，并把同一份数据写入完成日志的
+`stage_timings_ms`。响应头固定包含以下毫秒指标；当前请求未经过的阶段为 `0`：
+
+| 指标 | 语义 |
+|---|---|
+| `request-parse` | JSON/multipart 请求读取、解析和字段校验墙钟耗时 |
+| `base64-decode` | `/chinese_asr` Base64 解码耗时 |
+| `audio-split` | libsndfile 校验、解码及必要的 PCM16 WAV 切片耗时 |
+| `chunk-local-queue` / `chunk-local-queue-max` | 各分片等待单请求并发槽的累计值/最大值 |
+| `chunk-global-queue` / `chunk-global-queue-max` | 各分片等待全局长音频槽的累计值/最大值 |
+| `asr-backend` | 各分片 aiohttp 后端请求（连接等待、传输、上游处理和读取响应）的累计值 |
+| `asr` | 整条请求从创建分片任务到全部 ASR 分片完成的墙钟耗时 |
+| `aligner-queue` | 等待 `ALIGNER_CONCURRENCY` 槽的墙钟耗时 |
+| `aligner` | Aligner 线程调用的墙钟耗时，包含其分片解码和模型执行 |
+| `postprocess` | 文本合并、时间戳结构与响应对象构建耗时 |
+| `serialize` | JSON 响应同步编码耗时 |
+| `total` | 网关处理请求并形成响应的总墙钟耗时 |
+
+累计值可能大于 `total`，不同指标不可直接相加。`Server-Timing` 只用于性能诊断，不含音频、
+文本、热词或来源 URL；解析前即被服务器拒绝、客户端断开或进程终止时仍不保证响应头。
+
 ## 1. 业务兼容接口
 
 ### `POST /chinese_asr`

@@ -6,6 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import soundfile as sf
@@ -52,10 +53,12 @@ class AlignmentSkip:
 
 @dataclass(frozen=True)
 class AlignmentBatchResult:
-    """批量对齐结果；``units`` 与输入分片等长，``skipped`` 记录不支持的非空分片。"""
+    """批量对齐结果，并区分信号量排队与模型推理墙钟耗时。"""
 
     units: list[list[AlignedUnit]]
     skipped: list[AlignmentSkip]
+    queue_wait_ms: float = 0.0
+    inference_ms: float = 0.0
 
 
 def normalize_language(value: Any) -> str:
@@ -249,7 +252,7 @@ class ForcedAlignerEngine:
         """
         empty = [[] for _ in chunks]
         if not self.enabled:
-            return AlignmentBatchResult(empty, [])
+            return AlignmentBatchResult(empty, [], 0.0, 0.0)
         if len(chunks) != len(texts) or len(chunks) != len(languages):
             raise ValueError("ForcedAligner 分片、文本与语种数量不一致")
         normalized = [""] * len(chunks)
@@ -263,11 +266,17 @@ class ForcedAlignerEngine:
                 skipped.append(AlignmentSkip(index, str(language).strip()))
         if self._slots is None:
             self._slots = asyncio.Semaphore(settings.aligner_concurrency)
+        queue_started = perf_counter()
         async with self._slots:
+            queue_wait_ms = (perf_counter() - queue_started) * 1000
+            inference_started = perf_counter()
             units = await asyncio.to_thread(
                 self._align_batch_sync, chunks, texts, normalized
             )
-        return AlignmentBatchResult(units, skipped)
+            inference_ms = (perf_counter() - inference_started) * 1000
+        return AlignmentBatchResult(
+            units, skipped, round(queue_wait_ms, 2), round(inference_ms, 2)
+        )
 
 
 forced_aligner = ForcedAlignerEngine()
