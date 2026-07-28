@@ -150,7 +150,9 @@ python tests/test_chinese_asr_single.py --audio test_data/audio_16000_10s.wav
 python tests/verify_qwen_single.py --api-mode chinese-asr \
   --input test_data --ref test_data --baseline-cer 0.05
 python tests/test_service.py --api-mode chinese-asr \
-  --audio test_data/audio_16000_30s.wav --concurrency 96 --total 2000
+  --audio test_data/audio_16000_30s.wav --concurrency 96 --total 2000 \
+  --require-server-timing \
+  --output-json performance-results/PERF-BASE-001-run-01.json
 ```
 
 CER 门禁会拒绝缺失或空参考，不会以零计分样本误放行。生产发布还必须在目标 Linux/CUDA
