@@ -649,6 +649,28 @@ async def _recognize_chunks(
             result = await post(chunk, timing)
         except (Exception, asyncio.CancelledError) as error:
             total_ms = (perf_counter() - started) * 1000
+            root_error: BaseException = error
+            cause_depth = 0
+            seen_errors: set[int] = set()
+            while (
+                root_error.__cause__ is not None
+                and id(root_error) not in seen_errors
+                and cause_depth < 8
+            ):
+                seen_errors.add(id(root_error))
+                root_error = root_error.__cause__
+                cause_depth += 1
+            root_errno = getattr(root_error, "errno", None)
+            if not isinstance(root_errno, int):
+                os_error = getattr(root_error, "os_error", None)
+                root_errno = getattr(os_error, "errno", None)
+            exception_fields: dict[str, Any] = {
+                "exception_type": type(error).__name__,
+                "root_exception_type": type(root_error).__name__,
+                "exception_cause_depth": cause_depth,
+            }
+            if isinstance(root_errno, int):
+                exception_fields["root_errno"] = root_errno
             log_event(
                 logging.WARNING,
                 "backend_chunk_failed",
@@ -665,7 +687,7 @@ async def _recognize_chunks(
                 backend_queue_wait_ms=round(
                     timing["local_wait_ms"] + timing["global_wait_ms"], 2
                 ),
-                exception_type=type(error).__name__,
+                **exception_fields,
             )
             raise
         finally:
@@ -1033,13 +1055,20 @@ async def _session_context(app: web.Application):
         log_backup_count=settings.log_backup_count,
         log_retention_days=settings.log_retention_days,
         log_queue_size=settings.log_queue_size,
+        backend_connection_limit=settings.backend_connection_limit,
+        backend_keepalive_timeout=settings.backend_keepalive_timeout,
     )
     session: aiohttp.ClientSession | None = None
     started = False
     try:
         forced_aligner.load()
         timeout = aiohttp.ClientTimeout(total=settings.backend_timeout)
-        session = aiohttp.ClientSession(timeout=timeout)
+        connector = aiohttp.TCPConnector(
+            limit=settings.backend_connection_limit,
+            limit_per_host=settings.backend_connection_limit,
+            keepalive_timeout=settings.backend_keepalive_timeout,
+        )
+        session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         app["session"] = session
         app["long_chunk_slots"] = asyncio.Semaphore(settings.long_chunks_in_flight)
         started = True

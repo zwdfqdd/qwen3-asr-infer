@@ -16,7 +16,7 @@ if [[ -n "${PORT:-}" ]]; then
   unset PORT
 fi
 # 服务元数据与端口：8080 是唯一对外端口，8081 仅供本机网关访问。
-export SERVICE_VERSION="${SERVICE_VERSION:-2.0.0}"  # /health 返回的版本字符串。
+export SERVICE_VERSION="${SERVICE_VERSION:-2.1.0}"  # /health 返回的版本字符串。
 export VLLM_PORT="${VLLM_PORT:-8081}"  # vLLM 内部监听端口，范围 1～65535。
 export VLLM_HOST="${VLLM_HOST:-127.0.0.1}"  # vLLM 监听地址；默认禁止外部绕过网关。
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-asr}"  # vLLM 对外模型别名。
@@ -59,6 +59,8 @@ export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-280}"  # 完整 Base64 JSON 请求�
 export CHUNK_CONCURRENCY="${CHUNK_CONCURRENCY:-3}"  # 单个长请求最多并发提交的分片数。
 export LONG_CHUNKS_IN_FLIGHT="${LONG_CHUNKS_IN_FLIGHT:-96}"  # 全局长音频分片在途任务上限。
 export BACKEND_TIMEOUT="${BACKEND_TIMEOUT:-300}"  # 每个 vLLM 分片 HTTP 请求超时秒数。
+export BACKEND_CONNECTION_LIMIT="${BACKEND_CONNECTION_LIMIT:-100}"  # 网关到 vLLM 的连接池上限。
+export BACKEND_KEEPALIVE_TIMEOUT="${BACKEND_KEEPALIVE_TIMEOUT:-4}"  # 客户端空闲连接保留秒数；低于 vLLM 关闭窗口。
 export ENABLE_VAD="${ENABLE_VAD:-false}"  # 预留开关；当前设为 true 会拒绝启动。
 
 # 动态热词：仅作为 Qwen3-ASR Prompt 软偏置，不保证强制命中。

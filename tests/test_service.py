@@ -45,7 +45,8 @@ _PROM_SAMPLE_RE = re.compile(
 _PROM_LABEL_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)="((?:\\.|[^"\\])*)"')
 _ENV_ALLOWLIST = (
     "SERVICE_VERSION", "AUDIO_CHUNK_SECONDS", "CHUNK_CONCURRENCY",
-    "LONG_CHUNKS_IN_FLIGHT", "DTYPE", "VLLM_LOAD_FORMAT",
+    "LONG_CHUNKS_IN_FLIGHT", "BACKEND_TIMEOUT", "BACKEND_CONNECTION_LIMIT",
+    "BACKEND_KEEPALIVE_TIMEOUT", "DTYPE", "VLLM_LOAD_FORMAT",
     "VLLM_MAX_MODEL_LEN", "VLLM_MAX_NUM_SEQS",
     "VLLM_MAX_NUM_BATCHED_TOKENS", "VLLM_GPU_MEMORY_UTILIZATION",
     "VLLM_ATTENTION_BACKEND_NAME", "ALIGNER_DEVICE", "ALIGNER_DTYPE",
@@ -65,6 +66,7 @@ class Result:
     timings: dict[str, float] = field(default_factory=dict)
     timing_error: str = ""
     timing_required_failure: bool = False
+    request_id: str = ""
 
 
 @dataclass
@@ -306,6 +308,12 @@ async def _request(session, args, audio: bytes, filename: str, content_type: str
         async with session.post(args.url, **request_kwargs) as response:
             body = await response.text()
             latency = perf_counter() - started
+            raw_request_id = response.headers.get("X-Request-ID", "").strip()
+            request_id = (
+                raw_request_id
+                if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", raw_request_id)
+                else ""
+            )
             timings, timing_error = _parse_server_timing(
                 response.headers.get("Server-Timing")
             )
@@ -314,32 +322,36 @@ async def _request(session, args, audio: bytes, filename: str, content_type: str
                 chunks = int(chunk_header) if chunk_header is not None else None
             except ValueError:
                 return Result(latency, response.status, error=f"无效X-Audio-Chunks: {chunk_header}",
-                              timings=timings, timing_error=timing_error)
+                              timings=timings, timing_error=timing_error,
+                              request_id=request_id)
             try:
                 payload = json.loads(body)
             except json.JSONDecodeError:
                 return Result(latency, response.status, chunks=chunks,
                               error=f"无效JSON: {body[:300]}", timings=timings,
-                              timing_error=timing_error)
+                              timing_error=timing_error, request_id=request_id)
             if response.status != 200:
                 detail = payload.get("error") or payload.get("message") or body[:300]
-                return Result(latency, response.status, chunks=chunks, error=str(detail),
-                              timings=timings, timing_error=timing_error)
+                return Result(
+                    latency, response.status, chunks=chunks, error=str(detail),
+                    timings=timings, timing_error=timing_error, request_id=request_id,
+                )
             text_field = "istar_asr" if args.api_mode == "chinese-asr" else "text"
             text = payload.get(text_field)
             if not isinstance(text, str):
                 return Result(latency, response.status, chunks=chunks,
                               error=f"响应缺少{text_field}字段", timings=timings,
-                              timing_error=timing_error)
+                              timing_error=timing_error, request_id=request_id)
             if args.api_mode == "chinese-asr" and payload.get("code") != 0:
                 return Result(latency, response.status, chunks=chunks,
                               error=f"业务码异常: {payload.get('code')}", timings=timings,
-                              timing_error=timing_error)
+                              timing_error=timing_error, request_id=request_id)
             if timing_error and args.require_server_timing:
                 return Result(
                     latency, response.status, chunks, len(text),
                     error=f"Server-Timing要求未满足: {timing_error}", timings=timings,
                     timing_error=timing_error, timing_required_failure=True,
+                    request_id=request_id,
                 )
             return Result(latency, response.status, chunks, len(text),
                           timings=timings, timing_error=timing_error)
@@ -492,6 +504,9 @@ def _print_report(args, duration, expected_chunks, elapsed, results, resources):
         print("失败分类:")
         for reason, count in reasons.most_common(10):
             print(f"  {count} × {reason}")
+        failure_request_ids = [result.request_id for result in failures if result.request_id]
+        if failure_request_ids:
+            print("失败请求ID（最多20个）: " + ", ".join(failure_request_ids[:20]))
     if resources.gpu_utilization:
         print(
             f"GPU {args.gpu_index}: 平均 {statistics.fmean(resources.gpu_utilization):.1f}%  "
@@ -524,6 +539,16 @@ def _result_report(results: list[Result], elapsed: float, audio_duration: float)
         "total": len(results), "success": len(successes), "failure": len(failures),
         "status_counts": dict(status_counts),
         "error_counts": dict(error_counts),
+        "failure_samples": [
+            {
+                "status": result.status,
+                "error": result.error,
+                "request_id": result.request_id or None,
+                "latency_ms": result.latency * 1000,
+                "chunks": result.chunks,
+            }
+            for result in failures[:20]
+        ],
         "elapsed_seconds": elapsed,
         "qps": len(successes) / elapsed if elapsed else 0.0,
         "chunk_rps": chunks / elapsed if elapsed else 0.0,

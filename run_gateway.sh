@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
 # 服务元数据与路由；该调试入口不启动 vLLM，也不下载模型。
-export SERVICE_VERSION="${SERVICE_VERSION:-2.0.0}"  # /health 返回的版本字符串。
+export SERVICE_VERSION="${SERVICE_VERSION:-2.1.0}"  # /health 返回的版本字符串。
 export GATEWAY_HOST="${GATEWAY_HOST:-0.0.0.0}"  # aiohttp 网关监听地址。
 export GATEWAY_PORT="${GATEWAY_PORT:-8080}"  # 客户端访问的网关端口。
 export VLLM_PORT="${VLLM_PORT:-8081}"  # 已独立启动的 vLLM 端口。
@@ -28,6 +28,8 @@ export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-280}"  # 完整 Base64 JSON 请求�
 export CHUNK_CONCURRENCY="${CHUNK_CONCURRENCY:-3}"  # 单个长请求最多并发提交的分片数。
 export LONG_CHUNKS_IN_FLIGHT="${LONG_CHUNKS_IN_FLIGHT:-96}"  # 全局长音频分片在途任务上限。
 export BACKEND_TIMEOUT="${BACKEND_TIMEOUT:-300}"  # 每个 vLLM 分片 HTTP 请求超时秒数。
+export BACKEND_CONNECTION_LIMIT="${BACKEND_CONNECTION_LIMIT:-100}"  # 网关到 vLLM 的连接池上限。
+export BACKEND_KEEPALIVE_TIMEOUT="${BACKEND_KEEPALIVE_TIMEOUT:-4}"  # 客户端空闲连接保留秒数；低于 vLLM 关闭窗口。
 export ENABLE_VAD="${ENABLE_VAD:-false}"  # 未实现；设为 true 时拒绝启动。
 
 # 动态热词仅写入 Prompt；以下三项分别限制数量、单词长度和总字符数。

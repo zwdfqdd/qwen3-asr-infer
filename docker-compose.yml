@@ -27,7 +27,7 @@ services:
 
     environment:
       # 服务元数据与端口；vLLM 8081 仅监听容器回环地址。
-      SERVICE_VERSION: "${SERVICE_VERSION:-2.0.0}"
+      SERVICE_VERSION: "${SERVICE_VERSION:-2.1.0}"
       VLLM_HOST: "127.0.0.1"
       VLLM_PORT: "8081"
       GATEWAY_HOST: "0.0.0.0"
@@ -73,6 +73,8 @@ services:
       CHUNK_CONCURRENCY: "${CHUNK_CONCURRENCY:-3}"
       LONG_CHUNKS_IN_FLIGHT: "${LONG_CHUNKS_IN_FLIGHT:-96}"
       BACKEND_TIMEOUT: "${BACKEND_TIMEOUT:-300}"
+      BACKEND_CONNECTION_LIMIT: "${BACKEND_CONNECTION_LIMIT:-100}"
+      BACKEND_KEEPALIVE_TIMEOUT: "${BACKEND_KEEPALIVE_TIMEOUT:-4}"
       ENABLE_VAD: "false"
 
       # 动态热词仅作为 Qwen3-ASR Prompt 软偏置。

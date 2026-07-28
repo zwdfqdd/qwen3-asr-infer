@@ -60,6 +60,8 @@ class Settings:
     chunk_concurrency: int  # CHUNK_CONCURRENCY：单个长请求并行提交的最大分片数。
     long_chunks_in_flight: int  # LONG_CHUNKS_IN_FLIGHT：全局长音频分片在途上限。
     backend_timeout: float  # BACKEND_TIMEOUT：单个 vLLM 分片 HTTP 请求超时。
+    backend_connection_limit: int  # BACKEND_CONNECTION_LIMIT：到 vLLM 的连接池上限。
+    backend_keepalive_timeout: float  # BACKEND_KEEPALIVE_TIMEOUT：客户端空闲连接保留秒数。
 
     enable_hotword: bool  # ENABLE_HOTWORD：是否把动态热词写入 ASR Prompt。
     enable_vad: bool  # ENABLE_VAD：预留开关；当前开启会拒绝启动。
@@ -79,7 +81,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         result = cls(
-            service_version=os.getenv("SERVICE_VERSION", "2.0.0").strip(),
+            service_version=os.getenv("SERVICE_VERSION", "2.1.0").strip(),
             backend_url=os.getenv("BACKEND_URL", "http://127.0.0.1:8081").rstrip("/"),
             served_model_name=os.getenv("SERVED_MODEL_NAME", "qwen3-asr").strip(),
             gateway_host=os.getenv("GATEWAY_HOST", "0.0.0.0").strip(),
@@ -98,6 +100,8 @@ class Settings:
             chunk_concurrency=_env_int("CHUNK_CONCURRENCY", 3),
             long_chunks_in_flight=_env_int("LONG_CHUNKS_IN_FLIGHT", 96),
             backend_timeout=_env_float("BACKEND_TIMEOUT", 300),
+            backend_connection_limit=_env_int("BACKEND_CONNECTION_LIMIT", 100),
+            backend_keepalive_timeout=_env_float("BACKEND_KEEPALIVE_TIMEOUT", 4),
             enable_hotword=_env_bool("ENABLE_HOTWORD", True),
             enable_vad=_env_bool("ENABLE_VAD", False),
             enable_word_timestamp=_env_bool("ENABLE_WORD_TIMESTAMP", True),
@@ -130,6 +134,8 @@ class Settings:
             "CHUNK_CONCURRENCY": self.chunk_concurrency,
             "LONG_CHUNKS_IN_FLIGHT": self.long_chunks_in_flight,
             "BACKEND_TIMEOUT": self.backend_timeout,
+            "BACKEND_CONNECTION_LIMIT": self.backend_connection_limit,
+            "BACKEND_KEEPALIVE_TIMEOUT": self.backend_keepalive_timeout,
             "ALIGNER_CONCURRENCY": self.aligner_concurrency,
             "ALIGNER_BATCH_SIZE": self.aligner_batch_size,
             "MAX_HOTWORDS": self.max_hotwords,
