@@ -489,8 +489,12 @@ async def _post_transcription_chunk(
         async with app["session"].post(
             f"{settings.backend_url}/v1/audio/transcriptions", data=form
         ) as response:
-            body = await response.text()
             status = response.status
+            if timing is not None:
+                timing["upstream_status"] = status
+            body = await response.text()
+            if timing is not None:
+                timing["upstream_response_bytes"] = len(body.encode("utf-8"))
     except aiohttp.ClientConnectionError as error:
         raise APIError(
             ErrorCode.MODEL_LOAD_FAILED,
@@ -559,8 +563,12 @@ async def _post_chat_chunk(
         async with app["session"].post(
             f"{settings.backend_url}/v1/chat/completions", json=request_body
         ) as response:
-            body = await response.text()
             status = response.status
+            if timing is not None:
+                timing["upstream_status"] = status
+            body = await response.text()
+            if timing is not None:
+                timing["upstream_response_bytes"] = len(body.encode("utf-8"))
     except aiohttp.ClientConnectionError as error:
         raise APIError(
             ErrorCode.MODEL_LOAD_FAILED,
@@ -632,7 +640,13 @@ async def _recognize_chunks(
         index: int, chunk: AudioChunk
     ) -> tuple[ASRChunkResult, dict[str, float]]:
         started = perf_counter()
-        timing = {"local_wait_ms": 0.0, "global_wait_ms": 0.0, "http_ms": 0.0}
+        timing = {
+            "local_wait_ms": 0.0,
+            "global_wait_ms": 0.0,
+            "http_ms": 0.0,
+            "upstream_status": 0,
+            "upstream_response_bytes": 0,
+        }
         local_acquired = False
         global_acquired = False
         try:
@@ -671,6 +685,12 @@ async def _recognize_chunks(
             }
             if isinstance(root_errno, int):
                 exception_fields["root_errno"] = root_errno
+            upstream_status = timing["upstream_status"]
+            if isinstance(upstream_status, int) and upstream_status > 0:
+                exception_fields["upstream_status"] = upstream_status
+                exception_fields["upstream_response_bytes"] = int(
+                    timing["upstream_response_bytes"]
+                )
             log_event(
                 logging.WARNING,
                 "backend_chunk_failed",
