@@ -103,20 +103,22 @@ services:
       ALIGNER_BATCH_WAIT_MS: "${ALIGNER_BATCH_WAIT_MS:-5}"
       ALIGNER_QUEUE_SIZE: "${ALIGNER_QUEUE_SIZE:-256}"
 
-      # NVIDIA MPS：默认关闭。开启后 vLLM 与 Aligner 的 kernel 可并发执行，
-      # 目标 A10 实测端到端吞吐 +19.97%、P95 -16.32%，显存仅增加约 217 MiB。
-      # 开启前必须完成本文件下方注释中的 ipc 与管道目录配置，并在宿主启动
-      # nvidia-cuda-mps-control -d；守护进程缺失时 run.sh 会直接失败而不是静默降级。
-      ENABLE_MPS: "${ENABLE_MPS:-false}"
+      # NVIDIA MPS：让 vLLM 与 Aligner 的 kernel 并发执行，目标 A10 实测端到端吞吐
+      # +19.97%、P95 -16.32%，显存仅增加约 217 MiB。
+      # 注意：MPS 是宿主级透明特性，只要控制守护进程在运行且管道目录可达，容器内 CUDA 进程
+      # 就会自动接入，本服务无法通过配置关闭。REQUIRE_MPS 只表示“必须可用，否则拒绝启动”，
+      # 用于防止守护进程缺失导致的约 17.8% 静默降级。无论取值，启动日志都会声明实际状态。
+      REQUIRE_MPS: "${REQUIRE_MPS:-false}"
       CUDA_MPS_PIPE_DIRECTORY: "${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}"
       CUDA_MPS_LOG_DIRECTORY: "${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log}"
 
-    # 启用 MPS 需要额外放开容器隔离，因此不设为默认值。开启时取消以下两处注释：
+    # 使用 MPS 需要额外放开容器隔离，因此不设为默认值。需要时取消以下注释：
     #   ipc: host
     #   并在上方 volumes 增加：
     #     - /tmp/nvidia-mps:/tmp/nvidia-mps
     #     - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
     # ipc: host 会与宿主共享 IPC 命名空间，降低容器隔离性；请按安全要求评估后再启用。
+    # 未挂载管道目录时，容器内进程看不到宿主守护进程，因此不会接入 MPS。
     # 实测故障场景：网关退出、网关重启、控制守护进程被强杀均不影响 vLLM 与时间戳正确性。
 
     deploy:
