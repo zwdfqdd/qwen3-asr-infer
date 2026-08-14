@@ -911,6 +911,7 @@ async def chinese_asr(request: web.Request) -> web.Response:
         "response_format": "json",
     }
     prompt = _hotword_prompt(hotwords)
+    # 两条分支都必须产出 results、texts、languages 与 alignment，供后续合并与响应组装使用。
     pipeline_mode = settings.aligner_pipeline_enabled and forced_aligner.enabled
     async with forced_aligner.prepare_chunks(chunks) as alignment_preparation:
         if pipeline_mode:
@@ -934,6 +935,8 @@ async def chinese_asr(request: web.Request) -> web.Response:
                 )
                 request["stage_timings_ms"].update(asr_timings)
                 alignment = await pipeline.finish()
+                texts = [result.text for result in results]
+                languages = [result.language for result in results]
             except (asyncio.TimeoutError, RuntimeError, ValueError) as error:
                 pipeline.close()
                 log_event(
