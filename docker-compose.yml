@@ -105,10 +105,11 @@ services:
 
       # NVIDIA MPS：让 vLLM 与 Aligner 的 kernel 并发执行，目标 A10 实测端到端吞吐
       # +19.97%、P95 -16.32%，显存仅增加约 217 MiB。
-      # 注意：MPS 是宿主级透明特性，只要控制守护进程在运行且管道目录可达，容器内 CUDA 进程
-      # 就会自动接入，本服务无法通过配置关闭。REQUIRE_MPS 只表示“必须可用，否则拒绝启动”，
-      # 用于防止守护进程缺失导致的约 17.8% 静默降级。无论取值，启动日志都会声明实际状态。
-      REQUIRE_MPS: "${REQUIRE_MPS:-false}"
+      # MPS 是宿主级透明特性，仅靠环境变量无法决定是否走 MPS，因此 run.sh 会主动管理守护
+      # 进程：true 时不在线就启动，false 时在线且无活跃客户端就停止；有活跃客户端则拒绝启动，
+      # 不强行影响可能共用该守护进程的其他进程。两个方向的不一致都会让吞吐相差约 20%。
+      # 容器内启动守护进程需要 ipc: host；未挂载管道目录时容器看不到宿主守护进程。
+      ENABLE_MPS: "${ENABLE_MPS:-false}"
       CUDA_MPS_PIPE_DIRECTORY: "${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}"
       CUDA_MPS_LOG_DIRECTORY: "${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log}"
 

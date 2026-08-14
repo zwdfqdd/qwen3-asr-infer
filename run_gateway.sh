@@ -55,9 +55,9 @@ export ALIGNER_PREDECODE_MAX_MB="${ALIGNER_PREDECODE_MAX_MB:-128}"  # 全局已�
 export ALIGNER_BATCH_WAIT_MS="${ALIGNER_BATCH_WAIT_MS:-5}"  # 首条分片入队后的最大动态合批等待毫秒数。
 export ALIGNER_QUEUE_SIZE="${ALIGNER_QUEUE_SIZE:-256}"  # 有界对齐分片队列容量。
 
-# MPS 是宿主级透明特性，本服务无法通过配置关闭；REQUIRE_MPS 只表示“必须可用，否则拒绝启动”。
-# 本调试入口不启动 vLLM，因此只判定守护进程状态，不校验 server 是否已创建。
-export REQUIRE_MPS="${REQUIRE_MPS:-false}"  # true 时强制要求通过 MPS 运行网关 CUDA 进程。
+# MPS 是宿主级透明特性，只靠环境变量无法决定是否走 MPS。本调试入口不启动 vLLM，也不主动
+# 改变守护进程状态（避免与并行运行的 run.sh 抢管理权），只声明状态并在不一致时拒绝启动。
+export ENABLE_MPS="${ENABLE_MPS:-false}"  # 期望的 MPS 状态；不一致时报错，由 run.sh 负责调整。
 export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}"  # MPS 命名管道目录。
 export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log}"  # MPS 控制日志目录。
 
@@ -67,22 +67,23 @@ if command -v nvidia-cuda-mps-control >/dev/null 2>&1 \
   mps_online=true
 fi
 
-case "${REQUIRE_MPS,,}" in
+case "${ENABLE_MPS,,}" in
   true|1|yes|on)
     if [[ "$mps_online" != "true" ]]; then
-      echo "配置错误：REQUIRE_MPS=true，但 MPS 控制守护进程不可用（$CUDA_MPS_PIPE_DIRECTORY）。" >&2
+      echo "配置错误：ENABLE_MPS=true，但 MPS 控制守护进程不可用（$CUDA_MPS_PIPE_DIRECTORY）。" >&2
       echo "请先执行 nvidia-cuda-mps-control -d；守护进程缺失会导致吞吐静默下降且无告警。" >&2
       exit 1
     fi
-    echo "MPS 状态：守护进程在线（$CUDA_MPS_PIPE_DIRECTORY），已满足 REQUIRE_MPS=true。"
+    echo "MPS 状态：守护进程在线（$CUDA_MPS_PIPE_DIRECTORY），网关将作为 MPS 客户端运行。"
     ;;
   *)
     if [[ "$mps_online" == "true" ]]; then
-      echo "提示：MPS 守护进程正在运行，网关 CUDA 进程仍会作为 MPS 客户端运行；"
-      echo "要获得无 MPS 基线必须先停止守护进程。"
-    else
-      echo "MPS 状态：守护进程不在线，网关使用独立 CUDA 上下文。"
+      echo "配置错误：ENABLE_MPS=false，但 MPS 守护进程正在运行（$CUDA_MPS_PIPE_DIRECTORY）。" >&2
+      echo "网关仍会作为 MPS 客户端运行，性能结果不可与无 MPS 基线比较。" >&2
+      echo "请先停止守护进程：echo quit | nvidia-cuda-mps-control" >&2
+      exit 1
     fi
+    echo "MPS 状态：守护进程不在线，网关使用独立 CUDA 上下文。"
     ;;
 esac
 

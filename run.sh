@@ -91,12 +91,14 @@ export ALIGNER_BATCH_WAIT_MS="${ALIGNER_BATCH_WAIT_MS:-5}"  # 首条分片入队
 export ALIGNER_QUEUE_SIZE="${ALIGNER_QUEUE_SIZE:-256}"  # 有界对齐分片队列容量。
 
 # NVIDIA MPS：让 vLLM 与 Aligner 两个 CUDA 进程的 kernel 并发执行，实测端到端 +19.97%。
-# 重要：MPS 是宿主级透明特性。只要控制守护进程在运行且管道目录可达，任何 CUDA 进程都会
-# 自动作为 MPS 客户端接入；未设置 CUDA_MPS_PIPE_DIRECTORY 时运行时仍会查默认 /tmp/nvidia-mps。
-# 因此本服务无法通过配置“关闭”MPS，只能要求它必须可用。要真正不使用 MPS 必须停止守护进程。
-# REQUIRE_MPS=true 时守护进程缺失即拒绝启动：实测缺失会让吞吐静默下降约 17.8% 且全部健康
-# 指标正常。无论该开关取值，启动时都会打印实际接入状态，避免性能基线被误判。
-export REQUIRE_MPS="${REQUIRE_MPS:-false}"  # true 时强制要求通过 MPS 运行，否则拒绝启动。
+# MPS 是宿主级透明特性：只要控制守护进程在运行且管道目录可达，任何 CUDA 进程都会自动作为
+# MPS 客户端接入；未设置 CUDA_MPS_PIPE_DIRECTORY 时运行时仍会查默认 /tmp/nvidia-mps。
+# 因此仅靠环境变量无法决定是否走 MPS，本脚本改为按 ENABLE_MPS 主动管理守护进程生命周期：
+#   true  且守护进程不在线 → 启动它；已在线则直接复用。
+#   false 且守护进程在线   → 在确认没有活跃客户端后停止它，使进程使用独立上下文。
+# 实测两个方向的不一致都会让端到端吞吐相差约 20%，且全部健康指标正常、无任何告警，
+# 因此不允许带着与配置不符的状态继续启动。
+export ENABLE_MPS="${ENABLE_MPS:-false}"  # 是否通过 NVIDIA MPS 运行两个 CUDA 进程。
 export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}"  # MPS 命名管道目录。
 export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log}"  # MPS 控制日志目录。
 
@@ -115,44 +117,44 @@ mps_daemon_ready() {
   [[ "$output" != *"Cannot find MPS control daemon"* ]]
 }
 
-# 返回 0 表示至少已创建一个 MPS server。server 由首个客户端接入时创建，
-# 因此它是“确实有 CUDA 进程走 MPS”的可靠信号，比解析客户端列表稳定。
+# 返回 0 表示至少已创建一个 MPS server。server 由首个客户端接入时创建，并在最后一个客户端
+# 退出后消失，因此它既是“确实有进程走 MPS”的信号，也是“仍有活跃客户端”的判据，
+# 比解析 get_device_client_list 的非结构化输出稳定。
 mps_server_ready() {
   local output
   output="$(echo get_server_list | nvidia-cuda-mps-control 2>/dev/null)" || return 1
   [[ -n "${output//[[:space:]]/}" ]]
 }
 
-if enabled "$REQUIRE_MPS" && ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
-  echo "配置错误：REQUIRE_MPS=true，但当前环境没有 nvidia-cuda-mps-control。" >&2
-  echo "请改为 REQUIRE_MPS=false，或使用包含 MPS 控制工具的镜像重新部署。" >&2
+# 启动控制守护进程并等待其可响应；成功返回 0。
+mps_start_daemon() {
+  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY" || return 1
+  nvidia-cuda-mps-control -d >/dev/null 2>&1 || return 1
+  local attempt
+  for attempt in $(seq 1 20); do
+    mps_daemon_ready && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# 停止控制守护进程。返回 2 表示存在活跃客户端而拒绝停止；返回 1 表示停止失败。
+# quit 在仍有客户端连接时会阻塞等待，因此必须先判定 server 状态并加超时兜底。
+mps_stop_daemon() {
+  mps_server_ready && return 2
+  timeout 30 bash -c 'echo quit | nvidia-cuda-mps-control' >/dev/null 2>&1 || return 1
+  local attempt
+  for attempt in $(seq 1 20); do
+    mps_daemon_ready || return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+if enabled "$ENABLE_MPS" && ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+  echo "配置错误：ENABLE_MPS=true，但当前环境没有 nvidia-cuda-mps-control。" >&2
+  echo "请改为 ENABLE_MPS=false，或使用包含 MPS 控制工具的镜像重新部署。" >&2
   exit 1
-fi
-
-# 无条件探测并声明实际接入状态：MPS 由宿主守护进程决定，静默启用与静默降级都会
-# 让端到端吞吐相差约 20%，因此两种情况都必须在启动日志中明确可见。
-MPS_ACTIVE=false
-if command -v nvidia-cuda-mps-control >/dev/null 2>&1 && mps_daemon_ready; then
-  MPS_ACTIVE=true
-fi
-
-if enabled "$REQUIRE_MPS"; then
-  if [[ "$MPS_ACTIVE" != "true" ]]; then
-    echo "配置错误：REQUIRE_MPS=true，但 MPS 控制守护进程不可用。" >&2
-    echo "管道目录：$CUDA_MPS_PIPE_DIRECTORY" >&2
-    echo "请先在宿主或容器内启动：nvidia-cuda-mps-control -d" >&2
-    echo "容器还需以 --ipc=host 并挂载该管道目录运行。" >&2
-    echo "守护进程缺失时两个进程会退回独立 CUDA 上下文，吞吐约下降 17.8% 且无任何告警，" >&2
-    echo "因此这里直接失败，不允许静默降级。" >&2
-    exit 1
-  fi
-  echo "MPS 状态：守护进程在线（$CUDA_MPS_PIPE_DIRECTORY），已满足 REQUIRE_MPS=true。"
-elif [[ "$MPS_ACTIVE" == "true" ]]; then
-  echo "提示：MPS 守护进程正在运行（$CUDA_MPS_PIPE_DIRECTORY），两个 CUDA 进程仍会作为"
-  echo "MPS 客户端运行。本服务无法通过配置关闭 MPS；要获得无 MPS 基线必须先停止守护进程。"
-  echo "该状态下的性能结果不可与无 MPS 结果直接比较。"
-else
-  echo "MPS 状态：守护进程不在线，CUDA 进程使用各自独立上下文。"
 fi
 
 if enabled "$ENABLE_WORD_TIMESTAMP" || enabled "$ENABLE_SENTENCE_TIMESTAMP"; then
@@ -189,6 +191,56 @@ if [[ "$VLLM_PORT" == "$GATEWAY_PORT" ]]; then
 fi
 check_port_available "$VLLM_HOST" "$VLLM_PORT" "vLLM 后端"
 check_port_available "$GATEWAY_HOST" "$GATEWAY_PORT" "对外网关"
+
+# MPS 守护进程状态调整。它会改变宿主/容器级共享状态，因此放在端口等快速失败校验之后，
+# 避免因这些校验退出而遗留与配置不符的守护进程状态。
+if ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+  echo "MPS 状态：环境未提供 nvidia-cuda-mps-control，CUDA 进程使用各自独立上下文。"
+elif enabled "$ENABLE_MPS"; then
+  if mps_daemon_ready; then
+    echo "MPS 状态：守护进程已在线，直接复用（$CUDA_MPS_PIPE_DIRECTORY）。"
+  else
+    echo "MPS 状态：守护进程不在线，正在按 ENABLE_MPS=true 启动……"
+    if ! mps_start_daemon; then
+      echo "启动失败：无法拉起 MPS 控制守护进程。" >&2
+      echo "管道目录：$CUDA_MPS_PIPE_DIRECTORY，日志目录：$CUDA_MPS_LOG_DIRECTORY" >&2
+      echo "容器需以 --ipc=host 运行；请检查权限与 $CUDA_MPS_LOG_DIRECTORY/control.log。" >&2
+      exit 1
+    fi
+    echo "MPS 状态：守护进程已启动（$CUDA_MPS_PIPE_DIRECTORY）。"
+  fi
+elif mps_daemon_ready; then
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "配置错误：ENABLE_MPS=false 且守护进程在线，但环境缺少 timeout 命令。" >&2
+    echo "停止守护进程需要超时兜底，因为 quit 在仍有客户端时会无限等待。" >&2
+    echo "请安装 coreutils，或手工执行：echo quit | nvidia-cuda-mps-control" >&2
+    exit 1
+  fi
+  echo "MPS 状态：守护进程在线但 ENABLE_MPS=false，正在停止……"
+  set +e
+  mps_stop_daemon
+  mps_stop_status=$?
+  set -e
+  case "$mps_stop_status" in
+    0)
+      echo "MPS 状态：守护进程已停止，CUDA 进程将使用各自独立上下文。"
+      ;;
+    2)
+      echo "启动失败：ENABLE_MPS=false，但 MPS 守护进程仍有活跃客户端。" >&2
+      echo "该守护进程可能被本机其他 CUDA 进程共用，脚本不会强行停止它。" >&2
+      echo "请先停止这些客户端，或将本次启动改为 ENABLE_MPS=true。" >&2
+      echo "查看客户端：echo get_server_list | nvidia-cuda-mps-control" >&2
+      exit 1
+      ;;
+    *)
+      echo "启动失败：停止 MPS 守护进程超时或失败。" >&2
+      echo "请手工确认：ps -eo pid,ppid,cmd | grep '[n]vidia-cuda-mps'" >&2
+      exit 1
+      ;;
+  esac
+else
+  echo "MPS 状态：守护进程不在线，CUDA 进程使用各自独立上下文。"
+fi
 
 python -c 'import importlib, importlib.metadata as m; version=m.version("vllm"); assert version == "0.19.1", f"需要 vllm==0.19.1，当前为 {version}"; importlib.import_module("vllm.transformers_utils.configs.qwen3_asr")' || {
   echo "当前环境不兼容；请在独立虚拟环境执行: python -m pip install -r requirements-infer.txt" >&2
@@ -246,7 +298,7 @@ until python -c 'import sys,urllib.request; urllib.request.urlopen(sys.argv[1],t
   sleep 2
 done
 
-if enabled "$REQUIRE_MPS"; then
+if enabled "$ENABLE_MPS"; then
   if ! mps_server_ready; then
     echo "MPS 校验失败：vLLM 已就绪，但未创建任何 MPS server。" >&2
     echo "说明该进程没有作为 MPS 客户端运行，通常是启动时未继承 CUDA_MPS_PIPE_DIRECTORY。" >&2
