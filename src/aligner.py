@@ -643,6 +643,18 @@ class ForcedAlignerEngine:
             if stop_after_batch:
                 break
 
+    def start_pipeline(
+        self,
+        chunks: list[Any],
+        preparation: _AlignmentPreparation | None = None,
+    ) -> "_AlignmentPipeline":
+        """创建分片级流水提交器：每个分片 ASR 完成后即可入队，无需等整条请求。
+
+        与 ``align_chunks`` 的差别只是提交时机，入队与合批语义完全一致；因此单分片请求
+        两者等价，多分片长音频才会体现 ASR 与对齐的重叠收益。
+        """
+        return _AlignmentPipeline(self, chunks, preparation)
+
     async def align_chunks(
         self,
         chunks: list[Any],
@@ -766,6 +778,156 @@ class ForcedAlignerEngine:
             ), 2),
             predecode_count=len(prepared),
         )
+
+
+class _AlignmentPipeline:
+    """分片级对齐流水：按分片提交，最后统一收敛为与批量接口同构的结果。
+
+    入队与合批语义与 ``align_chunks`` 完全一致，唯一差别是提交时机由“整条请求 ASR 完成”
+    提前到“单个分片 ASR 完成”，使 ASR 与对齐两个阶段可以重叠。
+    """
+
+    def __init__(
+        self,
+        engine: "ForcedAlignerEngine",
+        chunks: list[Any],
+        preparation: _AlignmentPreparation | None,
+    ) -> None:
+        self._engine = engine
+        self._chunks = chunks
+        self._preparation = preparation
+        self._items: dict[int, _AlignmentWorkItem] = {}
+        self._submitted_at: dict[int, float] = {}
+        self._skipped: list[AlignmentSkip] = []
+        self._prepared: dict[int, _PreparedAudio] = {}
+        self._queue_depth_max = 0
+        self._predecode_wait_ms = 0.0
+        self._closed = False
+
+    @property
+    def enabled(self) -> bool:
+        return self._engine.enabled
+
+    async def submit(self, index: int, text: str, language: Any) -> None:
+        """提交单个已完成 ASR 的物理分片；空文本与不支持语种按原语义显式跳过。"""
+        if not self.enabled or self._closed:
+            return
+        if index in self._items or any(skip.chunk_index == index for skip in self._skipped):
+            raise RuntimeError(f"ForcedAligner 分片 {index} 重复提交")
+        if not text.strip():
+            return
+        try:
+            normalized = normalize_language(language)
+        except ValueError:
+            self._skipped.append(AlignmentSkip(index, str(language).strip()))
+            return
+
+        queue = self._engine._queue
+        lock = self._engine._submit_lock
+        if queue is None or lock is None or not self._engine._accepting:
+            raise RuntimeError("ForcedAligner 动态微批调度器未启动或正在关闭")
+
+        decoded_audio = None
+        if self._preparation is not None:
+            predecode_started = perf_counter()
+            prepared = await self._preparation.resolve([index])
+            self._predecode_wait_ms += (perf_counter() - predecode_started) * 1000
+            if index in prepared:
+                self._prepared[index] = prepared[index]
+                decoded_audio = prepared[index].audio
+
+        loop = asyncio.get_running_loop()
+        item = _AlignmentWorkItem(
+            chunk=self._chunks[index],
+            text=text,
+            language=normalized,
+            decoded_audio=decoded_audio,
+            future=loop.create_future(),
+        )
+        async with lock:
+            if not self._engine._accepting:
+                raise RuntimeError("ForcedAligner 动态微批调度器正在关闭")
+            self._submitted_at[index] = perf_counter()
+            await queue.put(item)
+            self._queue_depth_max = max(self._queue_depth_max, queue.qsize())
+        self._items[index] = item
+
+    async def finish(self) -> AlignmentBatchResult:
+        """等待全部已提交分片完成并聚合观测值；异常与取消语义与批量接口一致。"""
+        empty = [[] for _ in self._chunks]
+        if not self.enabled:
+            return AlignmentBatchResult(empty, [])
+        if not self._items:
+            return AlignmentBatchResult(empty, list(self._skipped))
+
+        indices = sorted(self._items)
+        try:
+            outcomes = await asyncio.gather(
+                *(self._items[index].future for index in indices),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            self._cancel_pending()
+            raise
+        for outcome in outcomes:
+            if isinstance(outcome, (asyncio.CancelledError, Exception)):
+                self._cancel_pending()
+                raise outcome
+
+        work_results: list[_AlignmentWorkResult] = list(outcomes)  # type: ignore[arg-type]
+        units = [[] for _ in self._chunks]
+        for index, result in zip(indices, work_results):
+            units[index] = result.units
+
+        # 流水模式下各分片提交时刻不同，排队等待取各分片最坏值；推理墙钟仍为
+        # 首批开始到末批结束，以便与批量模式的 aligner 阶段口径保持一致。
+        queue_wait_ms = max(
+            (result.batch_started_at - self._submitted_at[index]) * 1000
+            for index, result in zip(indices, work_results)
+        )
+        first_started_at = min(result.batch_started_at for result in work_results)
+        last_finished_at = max(result.batch_finished_at for result in work_results)
+        batch_results: dict[int, _AlignmentWorkResult] = {}
+        for result in work_results:
+            batch_results.setdefault(result.batch_id, result)
+        batches = {
+            batch_id: result.batch_size
+            for batch_id, result in batch_results.items()
+        }
+        return AlignmentBatchResult(
+            units=units,
+            skipped=list(self._skipped),
+            queue_wait_ms=round(queue_wait_ms, 2),
+            inference_ms=round((last_finished_at - first_started_at) * 1000, 2),
+            batch_count=len(batches),
+            batch_size_max=max(batches.values()),
+            batch_size_mean=round(sum(batches.values()) / len(batches), 2),
+            queue_depth_max=self._queue_depth_max,
+            batch_audio_decode_ms=round(sum(
+                result.audio_decode_ms for result in batch_results.values()
+            ), 2),
+            batch_model_call_ms=round(sum(
+                result.model_call_ms for result in batch_results.values()
+            ), 2),
+            batch_result_build_ms=round(sum(
+                result.result_build_ms for result in batch_results.values()
+            ), 2),
+            predecode_wait_ms=round(self._predecode_wait_ms, 2),
+            predecode_audio_decode_ms=round(sum(
+                prepared.decode_ms for prepared in self._prepared.values()
+            ), 2),
+            predecode_count=len(self._prepared),
+        )
+
+    def close(self) -> None:
+        """停止接收新分片并取消尚未完成的 future；共享 CUDA 批次不会被取消。"""
+        self._closed = True
+        self._cancel_pending()
+
+    def _cancel_pending(self) -> None:
+        for item in self._items.values():
+            if not item.future.done():
+                item.future.cancel()
 
 
 forced_aligner = ForcedAlignerEngine()

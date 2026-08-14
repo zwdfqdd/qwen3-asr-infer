@@ -83,6 +83,7 @@ class Settings:
     aligner_predecode_max_mb: int  # ALIGNER_PREDECODE_MAX_MB：全局已解码 PCM 字节预算（MiB）。
     aligner_batch_wait_ms: float  # ALIGNER_BATCH_WAIT_MS：首条入队后的最大动态合批等待毫秒数。
     aligner_queue_size: int  # ALIGNER_QUEUE_SIZE：有界对齐分片队列容量。
+    aligner_pipeline_enabled: bool  # ALIGNER_PIPELINE_ENABLED：分片 ASR 完成即提交对齐。
 
     max_hotwords: int  # MAX_HOTWORDS：去空、去重后的最大热词数量。
     max_hotword_length: int  # MAX_HOTWORD_LENGTH：单个热词最大 Unicode 字符数。
@@ -134,6 +135,9 @@ class Settings:
             aligner_predecode_max_mb=_env_int("ALIGNER_PREDECODE_MAX_MB", 128),
             aligner_batch_wait_ms=_env_float("ALIGNER_BATCH_WAIT_MS", 5),
             aligner_queue_size=_env_int("ALIGNER_QUEUE_SIZE", 256),
+            # 默认关闭：单分片请求与批量模式等价，多分片长音频才体现重叠收益，
+            # 需在目标机用真实多分片流量验证后再考虑改默认值。
+            aligner_pipeline_enabled=_env_bool("ALIGNER_PIPELINE_ENABLED", False),
             max_hotwords=_env_int("MAX_HOTWORDS", 100),
             max_hotword_length=_env_int("MAX_HOTWORD_LENGTH", 64),
             max_hotword_chars=_env_int("MAX_HOTWORD_CHARS", 1000),

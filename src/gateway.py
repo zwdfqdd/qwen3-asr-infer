@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import aiohttp
@@ -622,8 +623,13 @@ async def _recognize_chunks(
     requested_language: tuple[str, str] | None = None,
     prompt: str | None = None,
     detect_language: bool = True,
+    on_chunk_ready: Callable[[int, ASRChunkResult], Awaitable[None]] | None = None,
 ) -> tuple[list[ASRChunkResult], dict[str, float]]:
-    """并发识别分片，返回有序结果及队列、纯 HTTP 和 gather 墙钟计时。"""
+    """并发识别分片，返回有序结果及队列、纯 HTTP 和 gather 墙钟计时。
+
+    传入 ``on_chunk_ready`` 时，每个分片识别成功后立即回调，用于让下游阶段与 ASR 重叠。
+    回调在分片并发槽位释放之后执行，因此不会延长该分片对本地与全局在途额度的占用。
+    """
     if detect_language and requested_language is None:
         backend_api = "chat"
         post = lambda chunk, timing: _post_chat_chunk(app, chunk, prompt, timing)
@@ -648,6 +654,7 @@ async def _recognize_chunks(
     async def run_chunk(
         index: int, chunk: AudioChunk
     ) -> tuple[ASRChunkResult, dict[str, float]]:
+        """识别单个分片；提供 on_chunk_ready 时在本分片完成后立即回调。"""
         started = perf_counter()
         timing = {
             "local_wait_ms": 0.0,
@@ -744,6 +751,8 @@ async def _recognize_chunks(
             result_chars=len(result.text),
             language=_log_language_label(result.language),
         )
+        if on_chunk_ready is not None:
+            await on_chunk_ready(index, result)
         return result, timing
 
     gather_started = perf_counter()
@@ -902,38 +911,83 @@ async def chinese_asr(request: web.Request) -> web.Response:
         "response_format": "json",
     }
     prompt = _hotword_prompt(hotwords)
+    pipeline_mode = settings.aligner_pipeline_enabled and forced_aligner.enabled
     async with forced_aligner.prepare_chunks(chunks) as alignment_preparation:
-        results, asr_timings = await _recognize_chunks(
-            request.app,
-            chunks,
-            fields,
-            requested_language=requested_language,
-            prompt=prompt,
-        )
-        request["stage_timings_ms"].update(asr_timings)
-        texts = [result.text for result in results]
-        languages = [result.language for result in results]
-
-        aligner_started = perf_counter()
-        try:
-            alignment = await forced_aligner.align_chunks(
+        if pipeline_mode:
+            # 分片级流水：每个分片 ASR 完成即提交对齐，两个阶段重叠。因此
+            # aligner_latency_ms 覆盖“首个分片提交到全部对齐完成”，与 ASR 时间部分重叠，
+            # 不能与批量模式的同名字段直接相减比较。
+            pipeline = forced_aligner.start_pipeline(
+                chunks, preparation=alignment_preparation
+            )
+            aligner_started = perf_counter()
+            try:
+                results, asr_timings = await _recognize_chunks(
+                    request.app,
+                    chunks,
+                    fields,
+                    requested_language=requested_language,
+                    prompt=prompt,
+                    on_chunk_ready=lambda index, result: pipeline.submit(
+                        index, result.text, result.language
+                    ),
+                )
+                request["stage_timings_ms"].update(asr_timings)
+                alignment = await pipeline.finish()
+            except (asyncio.TimeoutError, RuntimeError, ValueError) as error:
+                pipeline.close()
+                log_event(
+                    logging.ERROR,
+                    "aligner_failed",
+                    "ForcedAligner 对齐失败",
+                    chunk_count=len(chunks),
+                    aligner_pipeline=True,
+                    aligner_latency_ms=round(
+                        (perf_counter() - aligner_started) * 1000, 2
+                    ),
+                    exception_type=type(error).__name__,
+                )
+                raise APIError(
+                    ErrorCode.ALIGNER_INFER_FAILED, "时间戳对齐失败"
+                ) from error
+            except BaseException:
+                pipeline.close()
+                raise
+        else:
+            results, asr_timings = await _recognize_chunks(
+                request.app,
                 chunks,
-                texts,
-                languages,
-                preparation=alignment_preparation,
+                fields,
+                requested_language=requested_language,
+                prompt=prompt,
             )
-        except (asyncio.TimeoutError, RuntimeError, ValueError) as error:
-            log_event(
-                logging.ERROR,
-                "aligner_failed",
-                "ForcedAligner 对齐失败",
-                chunk_count=len(chunks),
-                aligner_latency_ms=round(
-                    (perf_counter() - aligner_started) * 1000, 2
-                ),
-                exception_type=type(error).__name__,
-            )
-            raise APIError(ErrorCode.ALIGNER_INFER_FAILED, "时间戳对齐失败") from error
+            request["stage_timings_ms"].update(asr_timings)
+            texts = [result.text for result in results]
+            languages = [result.language for result in results]
+
+            aligner_started = perf_counter()
+            try:
+                alignment = await forced_aligner.align_chunks(
+                    chunks,
+                    texts,
+                    languages,
+                    preparation=alignment_preparation,
+                )
+            except (asyncio.TimeoutError, RuntimeError, ValueError) as error:
+                log_event(
+                    logging.ERROR,
+                    "aligner_failed",
+                    "ForcedAligner 对齐失败",
+                    chunk_count=len(chunks),
+                    aligner_pipeline=False,
+                    aligner_latency_ms=round(
+                        (perf_counter() - aligner_started) * 1000, 2
+                    ),
+                    exception_type=type(error).__name__,
+                )
+                raise APIError(
+                    ErrorCode.ALIGNER_INFER_FAILED, "时间戳对齐失败"
+                ) from error
     request["stage_timings_ms"]["aligner-queue"] = alignment.queue_wait_ms
     request["stage_timings_ms"]["aligner"] = alignment.inference_ms
     postprocess_started = perf_counter()
@@ -949,6 +1003,7 @@ async def chinese_asr(request: web.Request) -> web.Response:
             "aligner_completed",
             "ForcedAligner 对齐完成",
             chunk_count=len(chunks),
+            aligner_pipeline=pipeline_mode,
             aligner_latency_ms=round((perf_counter() - aligner_started) * 1000, 2),
             aligner_queue_wait_ms=alignment.queue_wait_ms,
             aligner_inference_ms=alignment.inference_ms,

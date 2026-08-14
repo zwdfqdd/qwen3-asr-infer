@@ -54,6 +54,7 @@ export ALIGNER_PREDECODE_ENABLED="${ALIGNER_PREDECODE_ENABLED:-false}"  # 是否
 export ALIGNER_PREDECODE_MAX_MB="${ALIGNER_PREDECODE_MAX_MB:-128}"  # 全局已解码 PCM 驻留预算，MiB。
 export ALIGNER_BATCH_WAIT_MS="${ALIGNER_BATCH_WAIT_MS:-5}"  # 首条分片入队后的最大动态合批等待毫秒数。
 export ALIGNER_QUEUE_SIZE="${ALIGNER_QUEUE_SIZE:-256}"  # 有界对齐分片队列容量。
+export ALIGNER_PIPELINE_ENABLED="${ALIGNER_PIPELINE_ENABLED:-false}"  # 是否启用分片级对齐流水。
 
 # MPS 是宿主级透明特性，只靠环境变量无法决定是否走 MPS。本调试入口不启动 vLLM，也不主动
 # 改变守护进程状态（避免与并行运行的 run.sh 抢管理权），只声明状态并在不一致时拒绝启动。
