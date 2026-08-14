@@ -81,12 +81,22 @@ export ALIGNER_DEVICE="${ALIGNER_DEVICE:-cuda:0}"  # Aligner 执行设备，如 
 export ALIGNER_DTYPE="${ALIGNER_DTYPE:-bfloat16}"  # Aligner 精度；CPU 必须使用 float32。
 export ALIGNER_ATTENTION_BACKEND="${ALIGNER_ATTENTION_BACKEND:-auto}"  # auto 保持 Transformers 自动选择；可实验 sdpa/flash_attention_2。
 export ALIGNER_CONCURRENCY="${ALIGNER_CONCURRENCY:-1}"  # 并发模型 worker 数；共享模型需验证线程安全。
-export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-1}"  # 单次模型调用跨请求合并的最大物理分片数。
+# batch=32 为目标 A10 实测最佳平衡：端到端由 107.33 升至 228.57 audio_s/s，显存峰值约 20315 MiB。
+# batch=48 因收益不足 5% 且显存再增被拒；batch=1 保留为逐片回滚值。
+export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-32}"  # 单次模型调用跨请求合并的最大物理分片数。
 export ALIGNER_DECODE_WORKERS="${ALIGNER_DECODE_WORKERS:-1}"  # 每批 WAV 并行解码线程上限；1 保留串行回滚。
 export ALIGNER_PREDECODE_ENABLED="${ALIGNER_PREDECODE_ENABLED:-false}"  # 是否在 ASR 阶段提前有界解码 PCM。
 export ALIGNER_PREDECODE_MAX_MB="${ALIGNER_PREDECODE_MAX_MB:-128}"  # 全局已解码 PCM 驻留预算，MiB。
 export ALIGNER_BATCH_WAIT_MS="${ALIGNER_BATCH_WAIT_MS:-5}"  # 首条分片入队后的最大动态合批等待毫秒数。
 export ALIGNER_QUEUE_SIZE="${ALIGNER_QUEUE_SIZE:-256}"  # 有界对齐分片队列容量。
+
+# NVIDIA MPS：让 vLLM 与 Aligner 两个 CUDA 进程的 kernel 并发执行，实测端到端 +19.97%。
+# 默认关闭，因为它依赖宿主守护进程与容器 IPC 配置，不适合作为隐式默认。
+# 开启时本脚本会强制校验守护进程与实际接入；实测守护进程缺失会导致吞吐静默下降约 17.8%
+# 且全部健康指标正常，因此不允许在校验失败后降级继续运行。
+export ENABLE_MPS="${ENABLE_MPS:-false}"  # 是否要求通过 NVIDIA MPS 运行两个 CUDA 进程。
+export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}"  # MPS 命名管道目录。
+export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log}"  # MPS 控制日志目录。
 
 # 参数：待判断的布尔文本；true/1/yes/on（不区分大小写）视为开启。
 enabled() {
@@ -95,6 +105,39 @@ enabled() {
     *) return 1 ;;
   esac
 }
+
+# 返回 0 表示 MPS 控制守护进程可响应；不解析客户端列表格式，只判定守护进程是否存在。
+mps_daemon_ready() {
+  local output
+  output="$(echo get_server_list | nvidia-cuda-mps-control 2>&1)" || return 1
+  [[ "$output" != *"Cannot find MPS control daemon"* ]]
+}
+
+# 返回 0 表示至少已创建一个 MPS server。server 由首个客户端接入时创建，
+# 因此它是“确实有 CUDA 进程走 MPS”的可靠信号，比解析客户端列表稳定。
+mps_server_ready() {
+  local output
+  output="$(echo get_server_list | nvidia-cuda-mps-control 2>/dev/null)" || return 1
+  [[ -n "${output//[[:space:]]/}" ]]
+}
+
+if enabled "$ENABLE_MPS"; then
+  if ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+    echo "配置错误：ENABLE_MPS=true，但当前环境没有 nvidia-cuda-mps-control。" >&2
+    echo "请改为 ENABLE_MPS=false，或使用包含 MPS 控制工具的镜像重新部署。" >&2
+    exit 1
+  fi
+  if ! mps_daemon_ready; then
+    echo "配置错误：ENABLE_MPS=true，但 MPS 控制守护进程不可用。" >&2
+    echo "管道目录：$CUDA_MPS_PIPE_DIRECTORY" >&2
+    echo "请先在宿主或容器内启动：nvidia-cuda-mps-control -d" >&2
+    echo "容器还需以 --ipc=host 并挂载该管道目录运行。" >&2
+    echo "守护进程缺失时两个进程会退回独立 CUDA 上下文，吞吐约下降 17.8% 且无任何告警，" >&2
+    echo "因此这里直接失败，不允许静默降级。" >&2
+    exit 1
+  fi
+  echo "MPS 已启用：管道目录=$CUDA_MPS_PIPE_DIRECTORY，日志目录=$CUDA_MPS_LOG_DIRECTORY。"
+fi
 
 if enabled "$ENABLE_WORD_TIMESTAMP" || enabled "$ENABLE_SENTENCE_TIMESTAMP"; then
   if [[ "$ALIGNER_ATTENTION_BACKEND" == "flash_attention_2" ]]; then
@@ -186,6 +229,16 @@ until python -c 'import sys,urllib.request; urllib.request.urlopen(sys.argv[1],t
   (( SECONDS < DEADLINE )) || { echo "等待 vLLM 就绪超时（${VLLM_STARTUP_TIMEOUT}s）" >&2; exit 1; }
   sleep 2
 done
+
+if enabled "$ENABLE_MPS"; then
+  if ! mps_server_ready; then
+    echo "MPS 校验失败：vLLM 已就绪，但未创建任何 MPS server。" >&2
+    echo "说明该进程没有作为 MPS 客户端运行，通常是启动时未继承 CUDA_MPS_PIPE_DIRECTORY。" >&2
+    echo "请确认守护进程存活、容器共享 IPC，并在同一环境变量下重新启动。" >&2
+    exit 1
+  fi
+  echo "MPS 校验通过：vLLM 已作为 MPS 客户端接入。"
+fi
 
 echo "=== vLLM 已就绪，启动对外网关 $GATEWAY_HOST:$GATEWAY_PORT ==="
 # 仅网关 stdout 恢复到容器原始 stdout，便于采集器按严格 JSON 解析。

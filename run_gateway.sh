@@ -47,12 +47,33 @@ export ALIGNER_DEVICE="${ALIGNER_DEVICE:-cuda:0}"  # Aligner 执行设备，如 
 export ALIGNER_DTYPE="${ALIGNER_DTYPE:-bfloat16}"  # Aligner 精度；CPU 必须使用 float32。
 export ALIGNER_ATTENTION_BACKEND="${ALIGNER_ATTENTION_BACKEND:-auto}"  # auto 保持现状；显式后端失败时拒绝启动。
 export ALIGNER_CONCURRENCY="${ALIGNER_CONCURRENCY:-1}"  # 并发模型 worker 数；共享模型需验证线程安全。
-export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-1}"  # 单次模型调用跨请求合并的最大物理分片数。
+# batch=32 为目标 A10 实测最佳平衡；batch=1 保留为逐片回滚值。与 run.sh 保持一致。
+export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-32}"  # 单次模型调用跨请求合并的最大物理分片数。
 export ALIGNER_DECODE_WORKERS="${ALIGNER_DECODE_WORKERS:-1}"  # 每批 WAV 并行解码线程上限；1 保留串行回滚。
 export ALIGNER_PREDECODE_ENABLED="${ALIGNER_PREDECODE_ENABLED:-false}"  # 是否在 ASR 阶段提前有界解码 PCM。
 export ALIGNER_PREDECODE_MAX_MB="${ALIGNER_PREDECODE_MAX_MB:-128}"  # 全局已解码 PCM 驻留预算，MiB。
 export ALIGNER_BATCH_WAIT_MS="${ALIGNER_BATCH_WAIT_MS:-5}"  # 首条分片入队后的最大动态合批等待毫秒数。
 export ALIGNER_QUEUE_SIZE="${ALIGNER_QUEUE_SIZE:-256}"  # 有界对齐分片队列容量。
+
+# MPS：本调试入口不启动 vLLM，因此只校验守护进程是否可用，不校验 server 是否已创建。
+export ENABLE_MPS="${ENABLE_MPS:-false}"  # 是否要求通过 NVIDIA MPS 运行网关 CUDA 进程。
+export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}"  # MPS 命名管道目录。
+export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log}"  # MPS 控制日志目录。
+
+case "${ENABLE_MPS,,}" in
+  true|1|yes|on)
+    if ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+      echo "配置错误：ENABLE_MPS=true，但当前环境没有 nvidia-cuda-mps-control。" >&2
+      exit 1
+    fi
+    if [[ "$(echo get_server_list | nvidia-cuda-mps-control 2>&1)" == *"Cannot find MPS control daemon"* ]]; then
+      echo "配置错误：ENABLE_MPS=true，但 MPS 控制守护进程不可用（$CUDA_MPS_PIPE_DIRECTORY）。" >&2
+      echo "请先执行 nvidia-cuda-mps-control -d；守护进程缺失会导致吞吐静默下降且无告警。" >&2
+      exit 1
+    fi
+    echo "MPS 已启用：管道目录=$CUDA_MPS_PIPE_DIRECTORY。"
+    ;;
+esac
 
 if [[ "$ALIGNER_ATTENTION_BACKEND" == "flash_attention_2" ]]; then
   if ! python -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("flash_attn") else 1)'; then

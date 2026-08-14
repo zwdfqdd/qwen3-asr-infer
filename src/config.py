@@ -126,7 +126,9 @@ class Settings:
                 "ALIGNER_ATTENTION_BACKEND", "auto"
             ).strip().lower(),
             aligner_concurrency=_env_int("ALIGNER_CONCURRENCY", 1),
-            aligner_batch_size=_env_int("ALIGNER_BATCH_SIZE", 1),
+            # batch=32 为目标 A10 实测最佳平衡：端到端 107.33→228.57 audio_s/s，显存峰值约
+            # 20315 MiB；batch=48 收益不足 5% 已拒绝，batch=1 保留为逐片回滚值。
+            aligner_batch_size=_env_int("ALIGNER_BATCH_SIZE", 32),
             aligner_decode_workers=_env_int("ALIGNER_DECODE_WORKERS", 1),
             aligner_predecode_enabled=_env_bool("ALIGNER_PREDECODE_ENABLED", False),
             aligner_predecode_max_mb=_env_int("ALIGNER_PREDECODE_MAX_MB", 128),
