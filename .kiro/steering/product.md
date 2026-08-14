@@ -6,7 +6,7 @@ CPU 网关；统一对外端口 8080。
 已实现：
 - `/chinese_asr` Base64 JSON 业务接口；
 - 有限 multipart `/v1/audio/transcriptions`；
-- 0～2000 秒音频，超过 32 秒固定分片、受控并发和顺序合并；
+- 0～7500 秒音频，超过 32 秒固定分片、受控并发和顺序合并；
 - 动态热词 Prompt 软偏置；
 - 分片级时间边界、健康检查、vLLM 指标和模型列表代理；
 - ModelScope 固定 revision 下载与完整性校验。

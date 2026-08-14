@@ -51,11 +51,12 @@ export VLLM_ATTENTION_BACKEND_NAME="${VLLM_ATTENTION_BACKEND_NAME:-FLASH_ATTN}" 
 export VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-600}"  # 等待 /health 就绪的总秒数。
 
 # 网关音频与请求限制。大小单位为 MiB，时长单位为秒，并发项单位为任务数。
-# Base64 约膨胀 1/3，因此 280 MiB JSON 请求体会先于同值的解码后音频上限触发。
+# 字节上限按 7500 秒 16 kHz 单声道 PCM16 WAV 推导：240,000,044 B 约 228.88 MiB → 229 MiB；
+# Base64 膨胀 4/3 后约 305.18 MiB，加 JSON 字段与热词开销 → 308 MiB。三项互相绑定。
 export AUDIO_CHUNK_SECONDS="${AUDIO_CHUNK_SECONDS:-32}"  # 长音频单个物理分片的最长秒数。
-export MAX_AUDIO_SECONDS="${MAX_AUDIO_SECONDS:-2000}"  # 解码后按采样帧计算的最大总秒数。
-export MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-280}"  # 解码后音频或 multipart 文件上限，MiB。
-export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-280}"  # 完整 Base64 JSON 请求体上限，MiB。
+export MAX_AUDIO_SECONDS="${MAX_AUDIO_SECONDS:-7500}"  # 解码后按采样帧计算的最大总秒数。
+export MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-229}"  # 解码后音频或 multipart 文件上限，MiB。
+export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-308}"  # 完整 Base64 JSON 请求体上限，MiB。
 export CHUNK_CONCURRENCY="${CHUNK_CONCURRENCY:-3}"  # 单个长请求最多并发提交的分片数。
 export LONG_CHUNKS_IN_FLIGHT="${LONG_CHUNKS_IN_FLIGHT:-96}"  # 全局长音频分片在途任务上限。
 export BACKEND_TIMEOUT="${BACKEND_TIMEOUT:-300}"  # 每个 vLLM 分片 HTTP 请求超时秒数。
@@ -69,8 +70,8 @@ export MAX_HOTWORDS="${MAX_HOTWORDS:-100}"  # 去空去重后的最大热词数�
 export MAX_HOTWORD_LENGTH="${MAX_HOTWORD_LENGTH:-64}"  # 单个热词最大 Unicode 字符数。
 export MAX_HOTWORD_CHARS="${MAX_HOTWORD_CHARS:-1000}"  # 全部热词最大 Unicode 字符总数。
 
-# ForcedAligner：两个开关分别控制字/词级 words 和按主模型标点聚合的句级 asr。
-# 单 A10 同卡试验保持 cuda:0、bfloat16、并发 1、batch 1；生产前必须验证显存与尾延迟。
+# ForcedAligner：worker 从有界队列动态聚合跨请求分片；batch=1 可回滚为逐片调用。
+# 单 A10 首轮保持单 worker；batch/max-wait 必须在目标机按显存、吞吐和尾延迟验收。
 export ENABLE_WORD_TIMESTAMP="${ENABLE_WORD_TIMESTAMP:-true}"  # 是否返回真实字/词级 words。
 export ENABLE_SENTENCE_TIMESTAMP="${ENABLE_SENTENCE_TIMESTAMP:-true}"  # 是否按标点聚合真实句级边界。
 export ALIGNER_MODEL_ID="${ALIGNER_MODEL_ID:-Qwen/Qwen3-ForcedAligner-0.6B}"  # ModelScope Aligner 仓库 ID。
@@ -78,8 +79,14 @@ export ALIGNER_MODEL_DIR="${ALIGNER_MODEL_DIR:-models/qwen3-forced-aligner-0.6b/
 export ALIGNER_MODELSCOPE_REVISION="${ALIGNER_MODELSCOPE_REVISION:-cf1c50164ea3ac48240d12bef5ead74aee0720cc}"  # 固定提交 revision。
 export ALIGNER_DEVICE="${ALIGNER_DEVICE:-cuda:0}"  # Aligner 执行设备，如 cuda:0 或 cpu。
 export ALIGNER_DTYPE="${ALIGNER_DTYPE:-bfloat16}"  # Aligner 精度；CPU 必须使用 float32。
-export ALIGNER_CONCURRENCY="${ALIGNER_CONCURRENCY:-1}"  # 同时进入 Aligner 的任务数。
-export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-1}"  # 单次模型调用包含的物理分片数。
+export ALIGNER_ATTENTION_BACKEND="${ALIGNER_ATTENTION_BACKEND:-auto}"  # auto 保持 Transformers 自动选择；可实验 sdpa/flash_attention_2。
+export ALIGNER_CONCURRENCY="${ALIGNER_CONCURRENCY:-1}"  # 并发模型 worker 数；共享模型需验证线程安全。
+export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-1}"  # 单次模型调用跨请求合并的最大物理分片数。
+export ALIGNER_DECODE_WORKERS="${ALIGNER_DECODE_WORKERS:-1}"  # 每批 WAV 并行解码线程上限；1 保留串行回滚。
+export ALIGNER_PREDECODE_ENABLED="${ALIGNER_PREDECODE_ENABLED:-false}"  # 是否在 ASR 阶段提前有界解码 PCM。
+export ALIGNER_PREDECODE_MAX_MB="${ALIGNER_PREDECODE_MAX_MB:-128}"  # 全局已解码 PCM 驻留预算，MiB。
+export ALIGNER_BATCH_WAIT_MS="${ALIGNER_BATCH_WAIT_MS:-5}"  # 首条分片入队后的最大动态合批等待毫秒数。
+export ALIGNER_QUEUE_SIZE="${ALIGNER_QUEUE_SIZE:-256}"  # 有界对齐分片队列容量。
 
 # 参数：待判断的布尔文本；true/1/yes/on（不区分大小写）视为开启。
 enabled() {
@@ -90,6 +97,13 @@ enabled() {
 }
 
 if enabled "$ENABLE_WORD_TIMESTAMP" || enabled "$ENABLE_SENTENCE_TIMESTAMP"; then
+  if [[ "$ALIGNER_ATTENTION_BACKEND" == "flash_attention_2" ]]; then
+    if ! python -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("flash_attn") else 1)'; then
+      echo "配置错误：ALIGNER_ATTENTION_BACKEND=flash_attention_2，但当前固定环境未安装 flash_attn。" >&2
+      echo "服务不会静默回退或运行时安装依赖；请恢复 auto/sdpa，或使用独立固定依赖镜像重新验收。" >&2
+      exit 1
+    fi
+  fi
   if [[ "$ALIGNER_DEVICE" == "cuda:0" ]]; then
     echo "警告：单卡双进程启用 ForcedAligner；vLLM 显存预算=$VLLM_GPU_MEMORY_UTILIZATION，Aligner=$ALIGNER_DEVICE/$ALIGNER_DTYPE。"
     echo "该模式仅用于低流量试验；若 OOM，请降低 VLLM_GPU_MEMORY_UTILIZATION 或改用独立 GPU/CPU。"
@@ -117,8 +131,13 @@ fi
 check_port_available "$VLLM_HOST" "$VLLM_PORT" "vLLM 后端"
 check_port_available "$GATEWAY_HOST" "$GATEWAY_PORT" "对外网关"
 
-python -c 'import importlib, importlib.metadata as m; version=m.version("vllm"); assert version == "0.16.0", f"需要 vllm==0.16.0，当前为 {version}"; importlib.import_module("vllm.transformers_utils.configs.qwen3_asr")' || {
+python -c 'import importlib, importlib.metadata as m; version=m.version("vllm"); assert version == "0.19.1", f"需要 vllm==0.19.1，当前为 {version}"; importlib.import_module("vllm.transformers_utils.configs.qwen3_asr")' || {
   echo "当前环境不兼容；请在独立虚拟环境执行: python -m pip install -r requirements-infer.txt" >&2
+  exit 1
+}
+# CUDA 12.x 构建校验：cu130 的 PyTorch 需要 580+ 驱动，在 535 驱动上会在 EngineCore 初始化时失败。
+python -c 'import torch; cuda=torch.version.cuda; assert cuda and cuda.startswith("12."), f"需要 CUDA 12.x 构建的 PyTorch，当前为 {cuda}"; torch.cuda.init()' || {
+  echo "PyTorch 与宿主 NVIDIA 驱动不兼容；请使用 CUDA 12.9 基础镜像，或将宿主驱动升级到 580 以上。" >&2
   exit 1
 }
 python scripts/download_model.py \
@@ -159,7 +178,7 @@ vllm serve "$MODEL_DIR" \
   --max-model-len "$VLLM_MAX_MODEL_LEN" --max-num-seqs "$VLLM_MAX_NUM_SEQS" \
   --max-num-batched-tokens "$VLLM_MAX_NUM_BATCHED_TOKENS" \
   --attention-config.backend "$VLLM_ATTENTION_BACKEND_NAME" \
-  --enable-chunked-prefill --generation-config vllm --disable-log-requests &
+  --enable-chunked-prefill --generation-config vllm &
 VLLM_PID=$!
 DEADLINE=$((SECONDS + VLLM_STARTUP_TIMEOUT))
 until python -c 'import sys,urllib.request; urllib.request.urlopen(sys.argv[1],timeout=2)' "$BACKEND_URL/health" >/dev/null 2>&1; do
@@ -179,5 +198,5 @@ set -e
 exit "$STATUS"
 
 
-#  docker run -it --gpus '"device=0"' --restart=always -p30960:8080 zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.16.0
-#  docker run -it --gpus '"device=1"' --restart=always -p30961:8080 zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.16.0
+#  docker run -it --gpus '"device=0"' --restart=always -p30960:8080 zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.19.1
+#  docker run -it --gpus '"device=1"' --restart=always -p30961:8080 zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.19.1

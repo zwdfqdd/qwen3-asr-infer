@@ -20,11 +20,11 @@ export LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"
 export LOG_QUEUE_SIZE="${LOG_QUEUE_SIZE:-10000}"
 
 # 音频与请求限制：大小单位 MiB，时长/超时单位秒，并发项单位为在途任务数。
-# 280 MiB JSON 会因 Base64 约 1/3 膨胀而先于同值音频上限触发。
+# 字节上限按 7500 秒 16 kHz 单声道 PCM16 WAV 推导：音频 229 MiB、Base64 JSON 请求体 308 MiB。
 export AUDIO_CHUNK_SECONDS="${AUDIO_CHUNK_SECONDS:-32}"  # 长音频单个物理分片的最长秒数。
-export MAX_AUDIO_SECONDS="${MAX_AUDIO_SECONDS:-2000}"  # 解码后按采样帧计算的最大总秒数。
-export MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-280}"  # 解码后音频或 multipart 文件上限，MiB。
-export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-280}"  # 完整 Base64 JSON 请求体上限，MiB。
+export MAX_AUDIO_SECONDS="${MAX_AUDIO_SECONDS:-7500}"  # 解码后按采样帧计算的最大总秒数。
+export MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-229}"  # 解码后音频或 multipart 文件上限，MiB。
+export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-308}"  # 完整 Base64 JSON 请求体上限，MiB。
 export CHUNK_CONCURRENCY="${CHUNK_CONCURRENCY:-3}"  # 单个长请求最多并发提交的分片数。
 export LONG_CHUNKS_IN_FLIGHT="${LONG_CHUNKS_IN_FLIGHT:-96}"  # 全局长音频分片在途任务上限。
 export BACKEND_TIMEOUT="${BACKEND_TIMEOUT:-300}"  # 每个 vLLM 分片 HTTP 请求超时秒数。
@@ -38,14 +38,28 @@ export MAX_HOTWORDS="${MAX_HOTWORDS:-100}"  # 去空去重后的最大热词数�
 export MAX_HOTWORD_LENGTH="${MAX_HOTWORD_LENGTH:-64}"  # 单个热词最大 Unicode 字符数。
 export MAX_HOTWORD_CHARS="${MAX_HOTWORD_CHARS:-1000}"  # 全部热词最大 Unicode 字符总数。
 
-# ForcedAligner 默认后处理；运行前需安装 requirements-aligner.txt 并准备本地模型。
-# 单 A10 同卡保持 cuda:0、bfloat16、并发 1、batch 1。
+# ForcedAligner 默认后处理；worker 通过有界队列动态聚合跨请求物理分片。
+# batch=1 是逐片回滚值；增大 batch 前必须验证显存、吞吐、尾延迟和时间戳契约。
 export ENABLE_WORD_TIMESTAMP="${ENABLE_WORD_TIMESTAMP:-true}"  # 是否返回真实字/词级 words。
 export ENABLE_SENTENCE_TIMESTAMP="${ENABLE_SENTENCE_TIMESTAMP:-true}"  # 是否按标点聚合真实句级边界。
 export ALIGNER_MODEL_DIR="${ALIGNER_MODEL_DIR:-models/qwen3-forced-aligner-0.6b/pt}"  # Aligner 本地权重目录。
 export ALIGNER_DEVICE="${ALIGNER_DEVICE:-cuda:0}"  # Aligner 执行设备，如 cuda:0 或 cpu。
 export ALIGNER_DTYPE="${ALIGNER_DTYPE:-bfloat16}"  # Aligner 精度；CPU 必须使用 float32。
-export ALIGNER_CONCURRENCY="${ALIGNER_CONCURRENCY:-1}"  # 同时进入 Aligner 的任务数。
-export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-1}"  # 单次模型调用包含的物理分片数。
+export ALIGNER_ATTENTION_BACKEND="${ALIGNER_ATTENTION_BACKEND:-auto}"  # auto 保持现状；显式后端失败时拒绝启动。
+export ALIGNER_CONCURRENCY="${ALIGNER_CONCURRENCY:-1}"  # 并发模型 worker 数；共享模型需验证线程安全。
+export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-1}"  # 单次模型调用跨请求合并的最大物理分片数。
+export ALIGNER_DECODE_WORKERS="${ALIGNER_DECODE_WORKERS:-1}"  # 每批 WAV 并行解码线程上限；1 保留串行回滚。
+export ALIGNER_PREDECODE_ENABLED="${ALIGNER_PREDECODE_ENABLED:-false}"  # 是否在 ASR 阶段提前有界解码 PCM。
+export ALIGNER_PREDECODE_MAX_MB="${ALIGNER_PREDECODE_MAX_MB:-128}"  # 全局已解码 PCM 驻留预算，MiB。
+export ALIGNER_BATCH_WAIT_MS="${ALIGNER_BATCH_WAIT_MS:-5}"  # 首条分片入队后的最大动态合批等待毫秒数。
+export ALIGNER_QUEUE_SIZE="${ALIGNER_QUEUE_SIZE:-256}"  # 有界对齐分片队列容量。
+
+if [[ "$ALIGNER_ATTENTION_BACKEND" == "flash_attention_2" ]]; then
+  if ! python -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("flash_attn") else 1)'; then
+    echo "配置错误：ALIGNER_ATTENTION_BACKEND=flash_attention_2，但当前固定环境未安装 flash_attn。" >&2
+    echo "网关不会静默回退或运行时安装依赖；请恢复 auto/sdpa，或使用独立固定依赖镜像重新验收。" >&2
+    exit 1
+  fi
+fi
 
 exec python src/gateway.py

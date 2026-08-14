@@ -1,0 +1,4 @@
+# PERF-ARCH-001 在当前单 Python 环境中运行，复用主服务与 PyTorch Aligner 精确依赖。
+-r ../../requirements-aligner.txt
+# spike 直接导入 numpy；显式固定，避免依赖解析结果漂移。
+numpy==2.2.6

@@ -9,7 +9,7 @@ Prompt、错误契约与健康/指标代理。v2.1.0 对外只暴露 `8080`。
            ├─ ≤32 秒：原字节直送
            ├─ >32 秒：最长 32 秒 PCM16 WAV 分片、受控并发、顺序合并
            ├─ /chinese_asr 协议转换与 Prompt 热词
-           └─ 默认 ForcedAligner 字/词级及句级时间戳
+           └─ ForcedAligner 有界跨请求动态微批 → 字/词级及句级时间戳
        → vLLM :8081（仅 127.0.0.1）
        → Qwen3-ASR-0.6B / continuous batching / CUDA Graph
 ```
@@ -20,7 +20,7 @@ Prompt、错误契约与健康/指标代理。v2.1.0 对外只暴露 `8080`。
 |---|---|
 | `/chinese_asr` Base64 JSON | 已实现 |
 | `/v1/audio/transcriptions` multipart 文本转写 | 已实现；仅有限兼容，不宣称完整 OpenAI API |
-| 0～2000 秒音频、超过 32 秒固定切分 | 已实现 |
+| 0～7500 秒音频、超过 32 秒固定切分 | 已实现；7500 秒场景的内存与尾延迟仍待实测 |
 | 动态热词 | 已实现；Qwen3-ASR Prompt 软偏置，不保证强制命中 |
 | 主模型标点 | 已实现；直接使用 Qwen3-ASR 输出，不使用 CT-Transformer |
 | 主模型语种识别 | 已实现；30 种语言与 22 种中国方言/口音，逐物理分片填充 `slid` |
@@ -101,9 +101,9 @@ python scripts/download_model.py \
   --revision cf1c50164ea3ac48240d12bef5ead74aee0720cc
 
 docker build --no-cache --build-arg INSTALL_ALIGNER=true \
-  -t qwen3-asr-infer:0.16.0 .
+  -t qwen3-asr-infer:0.19.1 .
 docker run -d --gpus '"device=0"' --restart=always \
-  -p 8080:8080 qwen3-asr-infer:0.16.0
+  -p 8080:8080 qwen3-asr-infer:0.19.1
 ```
 
 主模型固定 revision 为 `4ce9cc728b473a5aedbe7b6e1ea45646316824dc`。下载器校验文件大小
@@ -124,15 +124,34 @@ python tests/test_chinese_asr_single.py --audio test_data/audio_16000_10s.wav
 
 ## 默认输入与性能基线
 
-当前默认 `AUDIO_CHUNK_SECONDS=32`、`MAX_AUDIO_SECONDS=2000`、`MAX_UPLOAD_MB=280`、
-`MAX_JSON_BODY_MB=280`。Base64 会膨胀约 1/3，因此 280 MiB JSON 请求体只能承载约 210 MiB
-原始音频；multipart 仍由 280 MiB 请求体和音频上限共同约束。时长与两层字节限制分别保护
+当前默认 `AUDIO_CHUNK_SECONDS=32`、`MAX_AUDIO_SECONDS=7500`、`MAX_UPLOAD_MB=229`、
+`MAX_JSON_BODY_MB=308`。两个字节上限按 7500 秒 16 kHz 单声道 PCM16 WAV 推导：音频约
+228.88 MiB，Base64 后约 305.18 MiB；multipart 仍由请求体和音频上限共同约束。时长与两层字节限制分别保护
 解码后音频、HTTP 接收和进程内存。
 
 当前默认 `CHUNK_CONCURRENCY=3`、`LONG_CHUNKS_IN_FLIGHT=96`。网关到 vLLM 的连接池上限
-保持 100，空闲连接默认保留 4 秒，以避免复用已被后端关闭的连接；该稳定性候选仍须在目标 GPU
-完成三轮 100% 成功率门禁。历史 A10 纯 90 秒测试中 `3/96` 吞吐最高；仍须在 0～2000 秒真实
-混合流量和默认同卡 Aligner 模式下复测显存、吞吐及 P95/P99。详细数据和方法见
+保持 100，空闲连接默认保留 4 秒；目标 GPU 六轮累计 12000/12000，已验证不会复用失效空闲
+连接。固定依赖中的 Fast Tokenizer 由 `src/sitecustomize.py` 串行保护完整公共调用，消除并发
+Chat/多模态预处理触发的 `RuntimeError: Already borrowed` 和上游 HTTP 400；针对性验证及正式
+ASR-only 三轮累计 8000/8000。正式三轮中位数为 114.18 QPS、1141.75 audio_s/s、平均延迟
+824.0 ms、P95 1055.5 ms、P99 1606.0 ms。默认时间戳六轮中位数为 11.005 QPS、110.025
+audio_s/s，当前确定瓶颈是串行同卡 Aligner，而不是 ASR 数据面。`dev` 已实现 Aligner
+有界跨请求动态微批；生产默认仍保持 `ALIGNER_CONCURRENCY=1`、`ALIGNER_BATCH_SIZE=1`。目标
+A10 的 batch=4/8/16/32 单轮性能诊断均达到数值晋级线，其中 batch=32 达到 220.03
+audio_s/s、P95 4641.8 ms、P99 5585.0 ms，当前是最佳平衡候选。batch=48 虽升至 228.99
+audio_s/s，但仅增加 4.1%、P95 恶化 4.9%、显存升至 21821 MiB，已越过工程晋级拐点。
+固定 batch=32 后，worker=2 吞吐仅再增 3.7%，执行墙钟却增加 91.3%，同样被拒绝。
+attention=auto 已确认实际使用 SDPA，当前固定镜像缺少 `flash_attn`，显式 FA2 阻塞。batch=32
+阶段剖析达到 1000/1000、218.95 audio_s/s；每批 WAV 解码、官方 `model.align()`、结果构建均值
+分别为 281.12/1097.04/7.53 ms，占三项合计约 20.3%/79.2%/0.5%。`dev` 因此新增持久化
+有界并行解码池；生产默认 `ALIGNER_DECODE_WORKERS=1` 保持串行。decode-workers=4 首轮达到
+221.89 audio_s/s；解码仅下降 9.52%，模型调用反增 0.81%，最终吞吐仅 +1.34%、P95 -2.31%，
+未达到晋级线，已拒绝并恢复 1，不再测试其他线程数。`dev` 随后实现默认关闭的有界预解码；
+目标 A10 中预解码命中率 100%、残余等待仅 0.01 ms、批内解码降至 0.03 ms，但同卡
+`model.align()` 从 1097.04 增至 1351.02 ms，吞吐仅 +1.84%、P95 -1.58%，仍未晋级并恢复关闭。
+官方 `align()` 已使用 `torch.inference_mode()`，单卡软件路线收敛；下一步只能验证独立 Aligner
+GPU/实例拓扑。重复性、时间戳、混合流量与 CER 门禁完成前，不得修改生产默认值。历史 A10 纯 90 秒
+测试中 `3/96` 吞吐最高；仍须在 0～7500 秒真实混合流量下复测。详细数据和方法见
 [性能调优](docs/性能调优.md)。
 
 ## 文档
@@ -160,5 +179,5 @@ python tests/test_service.py --api-mode chinese-asr \
 CER 门禁会拒绝缺失或空参考，不会以零计分样本误放行。生产发布还必须在目标 Linux/CUDA
 环境完成 [发布验收](docs/发布验收.md)。
 
-docker run -it --gpus '"device=0"' --restart=always -p30960:8080 zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.16.0
-docker run -it --gpus '"device=1"' --restart=always -p30961:8080 zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.16.0
+docker run -it --gpus '"device=0"' --restart=always -p30960:8080 zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.19.1
+docker run -it --gpus '"device=1"' --restart=always -p30961:8080 zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.19.1

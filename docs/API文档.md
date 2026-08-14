@@ -29,8 +29,8 @@ HTTP 解析阶段即被拒绝、客户端提前断开、请求被取消或进程
 | `chunk-global-queue` / `chunk-global-queue-max` | 各分片等待全局长音频槽的累计值/最大值 |
 | `asr-backend` | 各分片 aiohttp 后端请求（连接等待、传输、上游处理和读取响应）的累计值 |
 | `asr` | 整条请求从创建分片任务到全部 ASR 分片完成的墙钟耗时 |
-| `aligner-queue` | 等待 `ALIGNER_CONCURRENCY` 槽的墙钟耗时 |
-| `aligner` | Aligner 线程调用的墙钟耗时，包含其分片解码和模型执行 |
+| `aligner-queue` | 请求提交对齐到其首个共享动态微批开始的墙钟耗时，包含有界队列背压和最大合批等待 |
+| `aligner` | 从请求首个共享批次开始到全部对齐分片完成的墙钟耗时；跨多个批次时包含后续批次等待与模型执行 |
 | `postprocess` | 文本合并、时间戳结构与响应对象构建耗时 |
 | `serialize` | JSON 响应同步编码耗时 |
 | `total` | 网关处理请求并形成响应的总墙钟耗时 |
@@ -67,9 +67,11 @@ Zhejiang、Cantonese (Hong Kong accent)、Cantonese (Guangdong accent)、Wu lang
 Minnan language。方言属于模型自动识别能力声明，但不是当前接口可显式强制的 `language`
 枚举；`slid` 忠实返回模型标签，不承诺对全部相近方言做到客观准确区分。
 
-限制：音频默认不超过 2000 秒；解码后的音频文件不超过 280 MiB；整个 JSON 请求体不超过
-280 MiB；最多 100 个热词，单词最多 64 字符，总计最多 1000 字符。Base64 会膨胀约 1/3，
-因此 280 MiB JSON 请求体最多承载约 210 MiB 原始音频；multipart 还会产生边界和字段开销。
+限制：音频默认不超过 7500 秒；解码后的音频文件不超过 229 MiB；整个 JSON 请求体不超过
+308 MiB；最多 100 个热词，单词最多 64 字符，总计最多 1000 字符。字节上限按目标输入格式
+16 kHz 单声道 PCM16 WAV 推导：7500 秒对应 240,000,044 字节约 228.88 MiB，Base64 膨胀 4/3
+后约 305.18 MiB，请求体上限额外留出 JSON 字段与热词开销。更高采样率、多声道或 24/32 位
+输入在同样时长下会先触发字节上限，这属于预期拒绝而不是缺陷；multipart 还会产生边界开销。
 `MAX_JSON_BODY_MB` 保护 HTTP 接收阶段，`MAX_UPLOAD_MB` 保护 Base64 解码后或 multipart
 文件读取阶段，二者不能由解析后的时长限制替代。`ENABLE_HOTWORD=false` 时热词仍会校验，
 但不进入 Prompt。
@@ -261,7 +263,7 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 ## 3. 管理端点
 
 - `GET /health`：同时检查网关与后端，成功返回
-  `{"status":"ok","version":"2.0.0","model":"qwen3-asr","timestamps":true,"aligner_device":"cuda:0"}`；
+  `{"status":"ok","version":"2.1.0","model":"qwen3-asr","timestamps":true,"aligner_device":"cuda:0"}`；
   时间戳关闭时 `timestamps=false`、`aligner_device=null`，后端不可用返回 503。
 - `GET /metrics`：透明代理 vLLM Prometheus 文本。
 - `GET /v1/models`：透明代理 vLLM 模型列表。

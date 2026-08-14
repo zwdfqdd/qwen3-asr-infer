@@ -3,7 +3,7 @@
 # ${变量:-默认值} 由 Compose 在创建容器前展开，再由镜像内 run.sh 读取。
 services:
   qwen3-asr:
-    image: zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.16.0
+    image: zhxgharbor.istarshine.com/asr/qwen3-asr-infer:0.19.1
     container_name: qwen3-asr
     # 容器异常退出或 Docker 重启后自动拉起；手工 stop 后保持停止，直到再次启动。
     restart: unless-stopped
@@ -91,8 +91,14 @@ services:
       ALIGNER_MODELSCOPE_REVISION: "${ALIGNER_MODELSCOPE_REVISION:-cf1c50164ea3ac48240d12bef5ead74aee0720cc}"
       ALIGNER_DEVICE: "${ALIGNER_DEVICE:-cuda:0}"
       ALIGNER_DTYPE: "${ALIGNER_DTYPE:-bfloat16}"
+      ALIGNER_ATTENTION_BACKEND: "${ALIGNER_ATTENTION_BACKEND:-auto}"
       ALIGNER_CONCURRENCY: "${ALIGNER_CONCURRENCY:-1}"
       ALIGNER_BATCH_SIZE: "${ALIGNER_BATCH_SIZE:-1}"
+      ALIGNER_DECODE_WORKERS: "${ALIGNER_DECODE_WORKERS:-1}"
+      ALIGNER_PREDECODE_ENABLED: "${ALIGNER_PREDECODE_ENABLED:-false}"
+      ALIGNER_PREDECODE_MAX_MB: "${ALIGNER_PREDECODE_MAX_MB:-128}"
+      ALIGNER_BATCH_WAIT_MS: "${ALIGNER_BATCH_WAIT_MS:-5}"
+      ALIGNER_QUEUE_SIZE: "${ALIGNER_QUEUE_SIZE:-256}"
 
     deploy:
       resources:

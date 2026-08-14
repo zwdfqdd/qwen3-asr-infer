@@ -1,6 +1,7 @@
-# Qwen3-ASR 原生 vLLM 0.16.0 + aiohttp 网关运行镜像。
+# Qwen3-ASR 原生 vLLM 0.19.1 + aiohttp 网关运行镜像。
+# 必须使用 CUDA 12.9 的 x86_64 基础镜像；cu130 变体需要 580+ 驱动，目标宿主为 535。
 # 不包含 TensorRT、ONNX、VAD、CT 标点或 Faiss；模型、测试和验收数据从构建上下文打入镜像。
-FROM zhxgharbor.istarshine.com/asr/vllm-openai:v0.16.0
+FROM zhxgharbor.istarshine.com/asr/vllm-openai:v0.19.1-x86_64
 
 USER root
 WORKDIR /qwen3asr_infer
@@ -48,7 +49,8 @@ RUN python -m pip install --no-cache-dir -r requirements-infer.txt \
          && python -m pip install --no-cache-dir -r requirements-aligner.txt; \
        fi \
     && python -m pip check \
-    && python -c "import importlib.metadata as m; assert m.version('vllm') == '0.16.0'; assert m.version('transformers') == '4.57.6'" \
+    && python -c "import importlib.metadata as m; assert m.version('vllm') == '0.19.1'; assert m.version('transformers') == '4.57.6'" \
+    && python -c "import torch; assert torch.version.cuda.startswith('12.'), f'需要 CUDA 12.x 构建的 PyTorch，当前为 {torch.version.cuda}'" \
     && if [ "$INSTALL_ALIGNER" = "true" ]; then \
          python -c "import importlib.metadata as m; from qwen_asr import Qwen3ForcedAligner; assert m.version('qwen-asr') == '0.0.6'; assert m.version('blinker') == '1.9.0'"; \
        fi

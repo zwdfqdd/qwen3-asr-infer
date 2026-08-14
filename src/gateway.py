@@ -77,6 +77,7 @@ class AudioChunk:
     content_type: str
     start: float
     end: float
+    pcm_bytes_estimate: int = 0
 
 
 @dataclass(frozen=True)
@@ -408,7 +409,14 @@ def _split_audio(audio: bytes, filename: str) -> list[AudioChunk]:
         if frames_per_chunk <= 0:
             raise APIError(ErrorCode.AUDIO_SEGMENT_ERROR, "音频切段参数无效")
         if source.frames <= frames_per_chunk:
-            return [AudioChunk(audio, filename, "application/octet-stream", 0.0, duration)]
+            return [AudioChunk(
+                audio,
+                filename,
+                "application/octet-stream",
+                0.0,
+                duration,
+                int(source.frames * source.channels * 4),
+            )]
         chunks: list[AudioChunk] = []
         stem = Path(filename).stem or "audio"
         index = 0
@@ -426,6 +434,7 @@ def _split_audio(audio: bytes, filename: str) -> list[AudioChunk]:
             chunks.append(AudioChunk(
                 buffer.getvalue(), f"{stem}_{index:03d}.wav", "audio/wav",
                 start_frame / source.samplerate, end_frame / source.samplerate,
+                int(samples.nbytes),
             ))
             index += 1
         if not chunks:
@@ -893,30 +902,38 @@ async def chinese_asr(request: web.Request) -> web.Response:
         "response_format": "json",
     }
     prompt = _hotword_prompt(hotwords)
-    results, asr_timings = await _recognize_chunks(
-        request.app,
-        chunks,
-        fields,
-        requested_language=requested_language,
-        prompt=prompt,
-    )
-    request["stage_timings_ms"].update(asr_timings)
-    texts = [result.text for result in results]
-    languages = [result.language for result in results]
-
-    aligner_started = perf_counter()
-    try:
-        alignment = await forced_aligner.align_chunks(chunks, texts, languages)
-    except (asyncio.TimeoutError, RuntimeError, ValueError) as error:
-        log_event(
-            logging.ERROR,
-            "aligner_failed",
-            "ForcedAligner 对齐失败",
-            chunk_count=len(chunks),
-            aligner_latency_ms=round((perf_counter() - aligner_started) * 1000, 2),
-            exception_type=type(error).__name__,
+    async with forced_aligner.prepare_chunks(chunks) as alignment_preparation:
+        results, asr_timings = await _recognize_chunks(
+            request.app,
+            chunks,
+            fields,
+            requested_language=requested_language,
+            prompt=prompt,
         )
-        raise APIError(ErrorCode.ALIGNER_INFER_FAILED, "时间戳对齐失败") from error
+        request["stage_timings_ms"].update(asr_timings)
+        texts = [result.text for result in results]
+        languages = [result.language for result in results]
+
+        aligner_started = perf_counter()
+        try:
+            alignment = await forced_aligner.align_chunks(
+                chunks,
+                texts,
+                languages,
+                preparation=alignment_preparation,
+            )
+        except (asyncio.TimeoutError, RuntimeError, ValueError) as error:
+            log_event(
+                logging.ERROR,
+                "aligner_failed",
+                "ForcedAligner 对齐失败",
+                chunk_count=len(chunks),
+                aligner_latency_ms=round(
+                    (perf_counter() - aligner_started) * 1000, 2
+                ),
+                exception_type=type(error).__name__,
+            )
+            raise APIError(ErrorCode.ALIGNER_INFER_FAILED, "时间戳对齐失败") from error
     request["stage_timings_ms"]["aligner-queue"] = alignment.queue_wait_ms
     request["stage_timings_ms"]["aligner"] = alignment.inference_ms
     postprocess_started = perf_counter()
@@ -935,6 +952,16 @@ async def chinese_asr(request: web.Request) -> web.Response:
             aligner_latency_ms=round((perf_counter() - aligner_started) * 1000, 2),
             aligner_queue_wait_ms=alignment.queue_wait_ms,
             aligner_inference_ms=alignment.inference_ms,
+            aligner_batch_count=alignment.batch_count,
+            aligner_batch_size_max=alignment.batch_size_max,
+            aligner_batch_size_mean=alignment.batch_size_mean,
+            aligner_queue_depth_max=alignment.queue_depth_max,
+            aligner_batch_audio_decode_ms=alignment.batch_audio_decode_ms,
+            aligner_batch_model_call_ms=alignment.batch_model_call_ms,
+            aligner_batch_result_build_ms=alignment.batch_result_build_ms,
+            aligner_predecode_wait_ms=alignment.predecode_wait_ms,
+            aligner_predecode_audio_decode_ms=alignment.predecode_audio_decode_ms,
+            aligner_predecode_count=alignment.predecode_count,
             aligned_unit_count=sum(map(len, aligned)),
             skipped_count=len(alignment.skipped),
             skipped_indices=sorted(skipped_indices),
@@ -1003,6 +1030,16 @@ async def chinese_asr(request: web.Request) -> web.Response:
             if (label := _log_language_label(language))
         }),
         alignment_skipped_count=len(alignment.skipped),
+        aligner_batch_count=alignment.batch_count,
+        aligner_batch_size_max=alignment.batch_size_max,
+        aligner_batch_size_mean=alignment.batch_size_mean,
+        aligner_queue_depth_max=alignment.queue_depth_max,
+        aligner_batch_audio_decode_ms=alignment.batch_audio_decode_ms,
+        aligner_batch_model_call_ms=alignment.batch_model_call_ms,
+        aligner_batch_result_build_ms=alignment.batch_result_build_ms,
+        aligner_predecode_wait_ms=alignment.predecode_wait_ms,
+        aligner_predecode_audio_decode_ms=alignment.predecode_audio_decode_ms,
+        aligner_predecode_count=alignment.predecode_count,
         warning_present=bool(warning),
     )
     _finish_stage(request, "postprocess", postprocess_started)
@@ -1077,11 +1114,21 @@ async def _session_context(app: web.Application):
         log_queue_size=settings.log_queue_size,
         backend_connection_limit=settings.backend_connection_limit,
         backend_keepalive_timeout=settings.backend_keepalive_timeout,
+        aligner_concurrency=settings.aligner_concurrency,
+        aligner_device=settings.aligner_device,
+        aligner_batch_size=settings.aligner_batch_size,
+        aligner_decode_workers=settings.aligner_decode_workers,
+        aligner_predecode_enabled=settings.aligner_predecode_enabled,
+        aligner_predecode_max_mb=settings.aligner_predecode_max_mb,
+        aligner_batch_wait_ms=settings.aligner_batch_wait_ms,
+        aligner_queue_size=settings.aligner_queue_size,
+        aligner_attention_backend_configured=settings.aligner_attention_backend,
     )
     session: aiohttp.ClientSession | None = None
     started = False
     try:
         forced_aligner.load()
+        await forced_aligner.start()
         timeout = aiohttp.ClientTimeout(total=settings.backend_timeout)
         connector = aiohttp.TCPConnector(
             limit=settings.backend_connection_limit,
@@ -1099,6 +1146,14 @@ async def _session_context(app: web.Application):
             service_version=settings.service_version,
             served_model_name=settings.served_model_name,
             timestamp_enabled=settings.timestamp_enabled,
+            aligner_device=(
+                settings.aligner_device if settings.timestamp_enabled else None
+            ),
+            aligner_decode_workers=settings.aligner_decode_workers,
+            aligner_predecode_enabled=settings.aligner_predecode_enabled,
+            aligner_predecode_max_mb=settings.aligner_predecode_max_mb,
+            aligner_attention_backend_configured=settings.aligner_attention_backend,
+            aligner_attention_backend_actual=forced_aligner.attention_backend_actual,
         )
         yield
     except Exception:  # noqa: BLE001 - 启动失败必须记录堆栈后继续抛出。
@@ -1113,17 +1168,20 @@ async def _session_context(app: web.Application):
         raise
     finally:
         try:
-            if session is not None and not session.closed:
-                await session.close()
+            await forced_aligner.close()
         finally:
-            log_event(
-                logging.INFO,
-                "gateway_stopped",
-                "网关已停止",
-                service_version=settings.service_version,
-                started=started,
-            )
-            shutdown_logging()
+            try:
+                if session is not None and not session.closed:
+                    await session.close()
+            finally:
+                log_event(
+                    logging.INFO,
+                    "gateway_stopped",
+                    "网关已停止",
+                    service_version=settings.service_version,
+                    started=started,
+                )
+                shutdown_logging()
 
 
 def create_app() -> web.Application:

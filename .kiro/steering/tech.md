@@ -1,7 +1,9 @@
 # 技术栈与常用命令
 
 - Python 3.10+；目标平台 Linux + NVIDIA CUDA。
-- GPU 推理：`vllm[audio]==0.16.0` + `transformers==4.57.6`，原生 Speech-to-Text。
+- GPU 推理：`vllm[audio]==0.19.1` + `transformers==4.57.6`，原生 Speech-to-Text；
+  必须使用 CUDA 12.9 基础镜像，因为目标 A10 宿主驱动为 535，无法运行 CUDA 13.0 构建。
+  时间戳仍由 `qwen-asr==0.0.6` PyTorch ForcedAligner 提供，token-classify 迁移为后续阶段。
 - CPU 网关：aiohttp 3.13.3 + soundfile 0.13.1。
 - 测试：aiohttp、soundfile、psutil；GPU 采样使用 `nvidia-smi`。
 - 必须使用独立 venv/镜像，不与 Paraformer、funasr、TensorRT 或 Transformers 5.x 混装。

@@ -1,7 +1,9 @@
 # Qwen3-ASR 原生 vLLM 在线异步服务；必须使用独立 venv/镜像。
-# vLLM 0.16 内置 Qwen3-ASR 配置、Processor 与模型执行器；CUDA/PyTorch 由对应 wheel 提供。
-vllm[audio]==0.16.0
-# 必须保持在 vLLM 0.16 要求的 >=4.56,<5 范围内，不可与 Transformers 5.x 混装。
+# vLLM 0.19.1 内置 Qwen3-ASR 配置、Processor、模型执行器和 ForcedAligner token-classify。
+# 选择 0.19.1 而不是 0.22.1 的唯一原因：0.20 起默认绑定 PyTorch 2.11 + CUDA 13.0，需要
+# 580 及以上驱动；目标 A10 宿主驱动为 535，只能运行 CUDA 12.x。升级宿主驱动后才可再评估上调。
+vllm[audio]==0.19.1
+# qwen-asr 0.0.6 需要 Transformers 4.57.6；vLLM 0.19.1 仍完整支持 Transformers v4。
 transformers==4.57.6
 
 # CPU 网关运行时依赖（服务端无需自建 FastAPI/Pydantic/Prometheus）。
