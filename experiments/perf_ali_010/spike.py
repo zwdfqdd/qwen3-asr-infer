@@ -88,13 +88,29 @@ def _percentile(values: list[float], ratio: float) -> float:
 
 
 def _stats(values: list[float]) -> dict[str, float]:
+    low, high = min(values), max(values)
     return {
         "mean": statistics.fmean(values),
         "p50": _percentile(values, 0.50),
         "p95": _percentile(values, 0.95),
-        "min": min(values),
-        "max": max(values),
+        "min": low,
+        "max": high,
+        # 极差比：首轮实测 batch=32 的 eager align 出现 min 836.70 / max 1939.73，
+        # 预热不足会让均值严重虚高，因此把稳定性作为报告的一等字段而非事后人工核对。
+        "max_over_min": round(high / low, 3) if low > 0 else float("inf"),
     }
+
+
+_STABILITY_LIMIT = 1.2
+
+
+def _unstable(*stats: dict[str, float]) -> list[str]:
+    """返回极差比超限的样本描述；超限说明该组测量不可用于判定。"""
+    return [
+        f"max/min={item['max_over_min']}"
+        for item in stats
+        if item["max_over_min"] > _STABILITY_LIMIT
+    ]
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -372,17 +388,37 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "dynamo_graphs_before": graphs_before,
             "dynamo_graphs_after": graphs_after,
+            "dynamo_graphs_added": (
+                graphs_after - graphs_before if graphs_before >= 0 else None
+            ),
             "compile_and_measure_wall_ms": round(compile_wall_ms, 2),
             "units_identical": True,
         }
+        # 编译只影响 GPU 前向；CPU 前后处理两次应基本一致，差异过大说明测量受污染。
+        item["cpu_eager_ms"] = round(eager_align["mean"] - eager_thinker["mean"], 2)
+        item["cpu_compiled_ms"] = round(
+            compiled_align["mean"] - compiled_thinker["mean"], 2
+        )
+        unstable = _unstable(
+            eager_align, compiled_align, eager_thinker, compiled_thinker
+        )
+        item["measurement_unstable"] = unstable or None
         report["results"].append(item)
         print(
             f"batch={batch_size} "
             f"align {eager_align['mean']:.2f}→{compiled_align['mean']:.2f} ms "
             f"({item['align_gain_percent']:+.2f}%)  "
             f"thinker {eager_thinker['mean']:.2f}→{compiled_thinker['mean']:.2f} ms "
-            f"({item['thinker_gain_percent']:+.2f}%)"
+            f"({item['thinker_gain_percent']:+.2f}%)  "
+            f"CPU {item['cpu_eager_ms']:.2f}/{item['cpu_compiled_ms']:.2f} ms  "
+            f"图 +{item['dynamo_graphs_added']}"
         )
+        if unstable:
+            print(
+                f"  警告：batch={batch_size} 测量不稳定（{', '.join(unstable)}），"
+                f"超过 {_STABILITY_LIMIT} 倍极差限制，该组数据不得用于判定；"
+                "请增大 --warmup 后重测。"
+            )
 
     return report
 
@@ -410,8 +446,9 @@ def main() -> int:
         default=_parse_batch_sizes("1,8,32"),
         help="逗号分隔的 batch size，默认 1,8,32；生产对照值为 32",
     )
-    parser.add_argument("--warmup", type=int, default=5, help="每组预热次数；编译需要足够预热")
-    parser.add_argument("--iterations", type=int, default=10, help="每组正式执行次数")
+    # 默认 15：实测 warmup=5 时 batch=32 的 eager align 极差达 2.3 倍，均值虚高约 54%。
+    parser.add_argument("--warmup", type=int, default=15, help="每组预热次数；不足会使均值虚高")
+    parser.add_argument("--iterations", type=int, default=30, help="每组正式执行次数")
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--device", default="cuda:0", help="Aligner 执行设备")
     parser.add_argument(

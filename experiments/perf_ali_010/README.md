@@ -90,8 +90,8 @@ python experiments/perf_ali_010/spike.py \
 | `--language` | 必填 | 官方语言名称 |
 | `--text` | 必填 | 参考文本；配 `--text-is-file` 时为路径 |
 | `--batch-sizes` | `1,8,32` | 生产对照值为 32 |
-| `--warmup` | `5` | 编译需要足够预热，避免把编译耗时计入 |
-| `--iterations` | `10` | 正式执行次数 |
+| `--warmup` | `15` | 预热不足会让 eager 均值虚高，见“预热不足的教训” |
+| `--iterations` | `30` | 正式执行次数 |
 | `--dtype` | `bfloat16` | 与生产一致；`float16` 为独立单变量 |
 | `--attention` | `auto` | 目标机 `auto` 实际选择 `sdpa` |
 | `--compile-mode` | `default` | 可选 `reduce-overhead`、`max-autotune` 等 |
@@ -122,3 +122,67 @@ python experiments/perf_ali_010/spike.py \
 - batch=32 的 `align()` 平均耗时相对 eager 至少下降 15%。
 - 无重编译迹象，无 NaN、OOM 或崩溃。
 - 达标后才考虑改 `src/aligner.py`，并需补真实混合长度与三轮压测验证。
+
+## 实测结果（2026-08-17，目标 A10，独占 GPU）
+
+有效数据只有一组：`--batch-sizes 32 --warmup 15 --iterations 30`，报告
+`performance-results/PERF-ALI-010/compile-b32-warm.json`。
+
+| 阶段 | eager mean | compiled mean | 变化 |
+|---|---:|---:|---:|
+| `align()` 全程 | 926.41 ms | 868.02 ms | **+6.30%** |
+| thinker 前向 | 670.05 ms | 559.62 ms | **+16.48%** |
+| CPU 部分（反推） | 256.36 ms | 308.40 ms | — |
+
+**判定：不晋级。** thinker 前向确实快了 16.48%，但生产口径的 `align()` 只降 6.30%，未达
+15% 晋级线。时间戳一致性通过，无 NaN、OOM 或崩溃，因此这是收益不足而非实现失败。
+不改 `src/aligner.py`。
+
+### 预热不足的教训
+
+首轮用默认 `--warmup 5`，得到的数字全部不可用：
+
+| batch | align 首轮 | thinker 首轮 |
+|---:|---:|---:|
+| 1 | +42.09% | +49.37% |
+| 8 | +15.89% | +19.18% |
+| 32 | **+47.40%** | +15.63% |
+
+batch=32 的 `align` 看似收益最大，实际是 eager 分母虚高：eager 的 min 836.70、p50 1547.16、
+max 1939.73，极差 2.3 倍。用 `align - thinker` 反推纯 CPU 部分可以直接定位问题——batch=1 两次
+均为 6.79 ms、batch=8 为 43.67/42.47 ms 都接近，唯独 batch=32 为 752.14/182.23 ms，差 570 ms。
+编译只替换 GPU 前向，不可能让 CPU 前后处理差半秒，所以差异只能来自测量本身。
+提到 `--warmup 15 --iterations 30` 后 align 收益从 +47.40% 落到真实的 +6.30%。
+
+由此固化两条防御：
+
+- `_stats()` 增加 `max_over_min` 极差比字段，稳定性是报告的一等数据而非事后人工核对；
+- `_STABILITY_LIMIT = 1.2`，任一组超限即在 `measurement_unstable` 标注并打印警告，该组数据
+  不得用于判定。同时把 `--warmup` 默认提到 15、`--iterations` 提到 30。
+
+**通用结论：编译类实验必须先证明 eager 基线稳定，再谈收益。** 分母不稳时收益百分比无意义，
+而且方向恰好是让收益偏大，容易误判为达标。
+
+### 副产品发现一：CPU 特征提取是更大的靶点
+
+batch=32 时 `align()` 的 926.41 ms 里约 **256 ms 在 CPU 上**（约 28%），主要是 processor 的
+mel 特征提取。这部分此前完全没有被识别出来：生产日志的 `aligner_batch_audio_decode_ms`
+（146.93 ms）只统计 WAV 解码，特征提取被算进了 `aligner_batch_model_call_ms`。
+
+也就是说 780 ms 的“模型调用”里有约三分之一不在 GPU 上跑。相对本实验能拿到的 6.30%，
+这个靶点空间更大，应另立实验。
+
+### 副产品发现二：图断裂与重编译
+
+`dynamo_graphs` 计数为 `-1→8`（batch=1 首次编译产生 8 处图断裂）、`8→12`（batch 从 1 变到 8
+又新增 4 个图，即 batch 变化触发重编译）、`12→12`（batch=32 复用）。
+
+`qwen-asr==0.0.6` 的 thinker 存在多处图断裂，这解释了收益为何有限。更重要的是生产影响：
+动态微批的批大小在 1～32 之间浮动，每个新形状都会重编译。本实验未量化该代价，若将来重启
+编译路线，必须先用 `--compile-dynamic` 单变量验证。
+
+### 后续可选单变量
+
+按一次只改一个变量的规则，尚未验证的方向：`--compile-mode reduce-overhead`（启用 CUDA graph
+进一步压 launch 开销）、`--compile-dynamic`（减少重编译）、`--dtype float16`。这些都只影响
+thinker 那 670 ms，而 CPU 的 256 ms 不受编译影响，因此 `align()` 的收益上限被 CPU 部分锁死。
