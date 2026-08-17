@@ -89,11 +89,13 @@ export ALIGNER_PREDECODE_ENABLED="${ALIGNER_PREDECODE_ENABLED:-false}"  # 是否
 export ALIGNER_PREDECODE_MAX_MB="${ALIGNER_PREDECODE_MAX_MB:-128}"  # 全局已解码 PCM 驻留预算，MiB。
 export ALIGNER_BATCH_WAIT_MS="${ALIGNER_BATCH_WAIT_MS:-5}"  # 首条分片入队后的最大动态合批等待毫秒数。
 export ALIGNER_QUEUE_SIZE="${ALIGNER_QUEUE_SIZE:-256}"  # 有界对齐分片队列容量。
-# 分片级流水：分片 ASR 完成即提交对齐，使两个阶段重叠。单分片请求与批量模式等价，
-# 多分片长音频才体现收益；默认关闭，待目标机多分片实测后再评估默认值。
+# 分片级流水：分片 ASR 完成即提交对齐。已实测拒绝，因为它与动态微批目标相反，会打散批次；
+# 保留开关仅为 Aligner 迁移到由 vLLM 调度器管理合批后重新实测之用。生产保持 false。
 export ALIGNER_PIPELINE_ENABLED="${ALIGNER_PIPELINE_ENABLED:-false}"  # 是否启用分片级对齐流水。
 
 # NVIDIA MPS：让 vLLM 与 Aligner 两个 CUDA 进程的 kernel 并发执行，实测端到端 +19.97%。
+# 说明：上面的分片级流水已实测拒绝（并发 96/4/1 为 -1.52%/+0.84%/+5.26%），它会打散动态微批，
+# 并发 1 时批次由 1 个变 4 个、对齐阶段 +134.9%。保持关闭；详见 docs/性能实验台账.md。
 # MPS 是宿主级透明特性：只要控制守护进程在运行且管道目录可达，任何 CUDA 进程都会自动作为
 # MPS 客户端接入；未设置 CUDA_MPS_PIPE_DIRECTORY 时运行时仍会查默认 /tmp/nvidia-mps。
 # 因此仅靠环境变量无法决定是否走 MPS，本脚本改为按 ENABLE_MPS 主动管理守护进程生命周期：

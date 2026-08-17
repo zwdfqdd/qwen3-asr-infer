@@ -102,8 +102,8 @@ services:
       ALIGNER_PREDECODE_MAX_MB: "${ALIGNER_PREDECODE_MAX_MB:-128}"
       ALIGNER_BATCH_WAIT_MS: "${ALIGNER_BATCH_WAIT_MS:-5}"
       ALIGNER_QUEUE_SIZE: "${ALIGNER_QUEUE_SIZE:-256}"
-      # 分片级流水：分片 ASR 完成即提交对齐。单分片请求与批量模式等价，多分片长音频才有
-      # 收益；默认关闭，待目标机多分片实测后再评估默认值。
+      # 分片级流水已实测拒绝：并发 96/4/1 为 -1.52%/+0.84%/+5.26%，它会打散动态微批。
+      # 生产保持 false；详见 docs/性能实验台账.md 的 PERF-ALI-009。
       ALIGNER_PIPELINE_ENABLED: "${ALIGNER_PIPELINE_ENABLED:-false}"
 
       # NVIDIA MPS：让 vLLM 与 Aligner 的 kernel 并发执行，目标 A10 实测端到端吞吐

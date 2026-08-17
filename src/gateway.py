@@ -918,6 +918,8 @@ async def chinese_asr(request: web.Request) -> web.Response:
             # 分片级流水：每个分片 ASR 完成即提交对齐，两个阶段重叠。因此
             # aligner_latency_ms 覆盖“首个分片提交到全部对齐完成”，与 ASR 时间部分重叠，
             # 不能与批量模式的同名字段直接相减比较。
+            # 该路径已实测拒绝（PERF-ALI-009）：提前提交会打散动态微批，对齐阶段反而变慢。
+            # 仅保留供 Aligner 改由 vLLM 调度器管理合批后重新实测，生产默认走 else 分支。
             pipeline = forced_aligner.start_pipeline(
                 chunks, preparation=alignment_preparation
             )
