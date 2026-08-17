@@ -159,7 +159,11 @@ def _dynamo_graph_count() -> int:
 
 
 def _build_inputs(aligner: Any, audios: list[Any], texts: list[str], languages: list[str]):
-    """复刻官方 align() 的 CPU 前处理，用于单独测量 thinker 前向。"""
+    """复刻官方 align() 的 CPU 前处理，用于单独测量 thinker 前向。
+
+    ``audios`` 必须是已归一化的裸 ndarray 列表，与官方 ``normalize_audios()`` 的输出一致；
+    输入音频已在 ``_load_audio`` 校验为 16 kHz 单声道 float32，因此该归一化为恒等变换。
+    """
     word_lists = []
     aligner_input_texts = []
     for text, language in zip(texts, languages):
@@ -186,7 +190,11 @@ def _time_align(
     warmup: int,
     iterations: int,
 ) -> tuple[dict[str, float], Any]:
-    """Phase A：测量 align() 全程，口径与生产 model_call 一致。"""
+    """Phase A：测量 align() 全程，口径与生产 model_call 一致。
+
+    ``audios`` 必须是 ``(np.ndarray, sr)`` 元组列表：官方 ``normalize_audios`` 只接受
+    路径、URL、base64 或该元组，不接受裸 ndarray。
+    """
     import torch
 
     for _ in range(warmup):
@@ -301,14 +309,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     print(f"模型已加载：attention={actual_attention}，dtype={args.dtype}")
 
     for batch_size in args.batch_sizes:
-        audios = [audio] * batch_size
+        # align() 走官方 normalize_audios，只接受 (ndarray, sr) 元组；
+        # processor 收的是归一化之后的裸 ndarray，两处入参形态不同。
+        align_audios = [(audio, 16000)] * batch_size
+        raw_audios = [audio] * batch_size
         texts = [text] * batch_size
         languages = [args.language] * batch_size
 
         eager_align, eager_results = _time_align(
-            aligner, audios, texts, languages, args.warmup, args.iterations
+            aligner, align_audios, texts, languages, args.warmup, args.iterations
         )
-        inputs, _ = _build_inputs(aligner, audios, texts, languages)
+        inputs, _ = _build_inputs(aligner, raw_audios, texts, languages)
         eager_thinker = _time_thinker(aligner, inputs, args.warmup, args.iterations)
         baseline_units = _units(eager_results)
 
@@ -325,7 +336,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         try:
             aligner.model.thinker = torch.compile(original_thinker, **compile_kwargs)
             compiled_align, compiled_results = _time_align(
-                aligner, audios, texts, languages, args.warmup, args.iterations
+                aligner, align_audios, texts, languages, args.warmup, args.iterations
             )
             compiled_thinker = _time_thinker(
                 aligner, inputs, args.warmup, args.iterations
