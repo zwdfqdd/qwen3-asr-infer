@@ -742,6 +742,116 @@ def _install_single_chunk_dynamic_audio_rewrite(
     }
 
 
+def _install_one_full_chunk_dynamic_audio_rewrite(
+    thinker: Any, tensor_inputs: dict[str, Any], torch: Any
+) -> dict[str, Any]:
+    from torch.nn import functional as functional
+
+    contract = _validate_dynamic_shape_input(
+        tensor_inputs, "full1 动态尾块输入", torch
+    )
+    if contract["audio_full_chunks"] != 1 or contract["audio_tail_frames"] == 0:
+        raise RuntimeError(
+            "full1 动态尾块改写只接受一个完整 chunk 加非零尾块，"
+            f"实际 contract={contract}"
+        )
+    if tensor_inputs.get("feature_attention_mask") is None:
+        raise RuntimeError("full1 动态尾块改写缺少 feature_attention_mask")
+
+    audio_tower = thinker.audio_tower
+    attention_implementation = str(audio_tower.config._attn_implementation)
+    if attention_implementation != "sdpa":
+        raise RuntimeError(
+            "full1 动态尾块改写依赖生产 SDPA 单序列语义，"
+            f"实际为 {attention_implementation}"
+        )
+    window = int(audio_tower.n_window) * 2
+    if window != _DYNAMIC_AUDIO_WINDOW:
+        raise RuntimeError(
+            f"full1 动态尾块契约要求 window={_DYNAMIC_AUDIO_WINDOW}，实际为 {window}"
+        )
+    bucket = _tail_output_bucket(contract["audio_tail_frames"])
+    bucket_start = (bucket["output_length"] - 1) * 8 + 1
+    bucket_end = min(bucket["output_length"] * 8, window - 1)
+    output_per_full_chunk = _feature_output_length(window)
+    retained_output_length = output_per_full_chunk + bucket["output_length"]
+    padded_audio_frames = window * 2
+
+    def one_full_chunk_audio_forward(
+        module: Any,
+        current_features: Any,
+        feature_lens: Any = None,
+        aftercnn_lens: Any = None,
+    ) -> Any:
+        del feature_lens, aftercnn_lens
+        tail_padding = padded_audio_frames - current_features.shape[-1]
+        padded_features = functional.pad(current_features, (0, tail_padding))
+        chunks = (
+            padded_features.transpose(0, 1)
+            .reshape(2, window, padded_features.shape[0])
+            .transpose(1, 2)
+        )
+        padded_embed = functional.gelu(module.conv2d1(chunks.unsqueeze(1)))
+        padded_embed = functional.gelu(module.conv2d2(padded_embed))
+        padded_embed = functional.gelu(module.conv2d3(padded_embed))
+        batch, channels, frequency, time = padded_embed.size()
+        padded_embed = module.conv_out(
+            padded_embed.permute(0, 3, 1, 2)
+            .contiguous()
+            .view(batch, time, channels * frequency)
+        )
+        positional_embedding = (
+            module.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
+            .unsqueeze(0)
+            .to(padded_embed.dtype)
+        )
+        hidden_states = (padded_embed + positional_embedding).reshape(
+            -1, padded_embed.shape[-1]
+        )[:retained_output_length]
+        cu_seqlens = torch.arange(
+            2, dtype=torch.int32, device=hidden_states.device
+        ) * hidden_states.shape[0]
+        for encoder_layer in module.layers:
+            hidden_states = encoder_layer(hidden_states, cu_seqlens)[0]
+        hidden_states = module.ln_post(hidden_states)
+        hidden_states = module.proj1(hidden_states)
+        hidden_states = module.act(hidden_states)
+        return module.proj2(hidden_states)
+
+    def one_full_chunk_get_audio_features(
+        module: Any,
+        current_features: Any,
+        feature_attention_mask: Any = None,
+        audio_feature_lengths: Any = None,
+    ) -> Any:
+        del feature_attention_mask, audio_feature_lengths
+        return module.audio_tower(current_features[0])
+
+    audio_tower.forward = MethodType(one_full_chunk_audio_forward, audio_tower)
+    thinker.get_audio_features = MethodType(
+        one_full_chunk_get_audio_features, thinker
+    )
+    return {
+        "enabled": True,
+        "batch_size": 1,
+        "window": window,
+        "audio_frame_domain": (
+            f"[{window + bucket_start}, {window + bucket_end}]"
+        ),
+        "audio_full_chunks_example": 1,
+        "audio_tail_frames_example": contract["audio_tail_frames"],
+        "tail_output_length": bucket["output_length"],
+        "tail_bucket_start": bucket_start,
+        "tail_bucket_end": bucket_end,
+        "output_per_full_chunk": output_per_full_chunk,
+        "retained_output_length": retained_output_length,
+        "padded_audio_frames": padded_audio_frames,
+        "tail_frames_dynamic": True,
+        "attention_implementation": attention_implementation,
+        "cu_seqlens_strategy": "single_full_sequence_for_sdpa",
+    }
+
+
 def _install_fixed_text_mask_specialization(
     thinker: Any, tensor_inputs: dict[str, Any], torch: Any
 ) -> dict[str, Any]:
@@ -862,6 +972,9 @@ def _run_target(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "--direct-short-single-chunk-bucket": (
             args.direct_short_single_chunk_bucket
+        ),
+        "--direct-one-full-chunk-tail-bucket": (
+            args.direct_one_full_chunk_tail_bucket
         ),
     }
     for option, enabled in dynamic_audio_modes.items():
@@ -986,6 +1099,29 @@ def _run_target(args: argparse.Namespace) -> dict[str, Any]:
                     "原生单 chunk 动态模式要求主输入与回放位于同一 CNN 输出桶："
                     f"main={main_bucket}, replay={replay_bucket}"
                 )
+        elif args.direct_one_full_chunk_tail_bucket:
+            main_bucket = _tail_output_bucket(
+                dynamic_input_contract["audio_tail_frames"]
+            )
+            replay_bucket = _tail_output_bucket(replay_contract["audio_tail_frames"])
+            if (
+                dynamic_input_contract["audio_full_chunks"] != 1
+                or replay_contract["audio_full_chunks"] != 1
+            ):
+                raise RuntimeError(
+                    "full1 动态尾块模式要求主输入与回放的 "
+                    "audio_full_chunks 均为 1"
+                )
+            if (
+                dynamic_input_contract["audio_tail_frames"]
+                == replay_contract["audio_tail_frames"]
+            ):
+                raise RuntimeError("full1 动态尾块模式要求主输入与回放尾帧数不同")
+            if main_bucket["output_length"] != replay_bucket["output_length"]:
+                raise RuntimeError(
+                    "full1 动态尾块模式要求主输入与回放位于同一 CNN 尾块输出桶："
+                    f"main={main_bucket}, replay={replay_bucket}"
+                )
         elif args.normalize_short_tail_to_full_chunks:
             main_bucket = _tail_output_bucket(
                 dynamic_input_contract["audio_tail_frames"]
@@ -1049,6 +1185,7 @@ def _run_target(args: argparse.Namespace) -> dict[str, Any]:
     tail_bucket_canonicalization = None
     short_tail_normalization = None
     direct_short_bucket_plan = None
+    direct_one_full_chunk_bucket_plan = None
     trailing_output_drop_override = None
     if args.direct_short_single_chunk_bucket:
         main_bucket = _tail_output_bucket(dynamic_input_contract["audio_frames"])
@@ -1065,6 +1202,33 @@ def _run_target(args: argparse.Namespace) -> dict[str, Any]:
         }
         if replay_bucket["output_length"] != output_length:
             raise RuntimeError("原生单 chunk 主输入与回放的 CNN 输出桶不一致")
+    elif args.direct_one_full_chunk_tail_bucket:
+        main_bucket = _tail_output_bucket(
+            dynamic_input_contract["audio_tail_frames"]
+        )
+        replay_bucket = _tail_output_bucket(
+            shape_replay["contract"]["audio_tail_frames"]
+        )
+        output_length = main_bucket["output_length"]
+        bucket_start = (output_length - 1) * 8 + 1
+        bucket_end = min(output_length * 8, _DYNAMIC_AUDIO_WINDOW - 1)
+        direct_one_full_chunk_bucket_plan = {
+            "tail_output_length": output_length,
+            "tail_bucket_start": bucket_start,
+            "tail_bucket_end": bucket_end,
+            "audio_frame_min": _DYNAMIC_AUDIO_WINDOW + bucket_start,
+            "audio_frame_max": _DYNAMIC_AUDIO_WINDOW + bucket_end,
+            "main_audio_frames": dynamic_input_contract["audio_frames"],
+            "main_tail_frames": dynamic_input_contract["audio_tail_frames"],
+            "shape_replay_audio_frames": shape_replay["contract"]["audio_frames"],
+            "shape_replay_tail_frames": shape_replay["contract"]["audio_tail_frames"],
+            "padded_audio_frames": _DYNAMIC_AUDIO_WINDOW * 2,
+            "retained_output_length": (
+                _feature_output_length(_DYNAMIC_AUDIO_WINDOW) + output_length
+            ),
+        }
+        if replay_bucket["output_length"] != output_length:
+            raise RuntimeError("full1 主输入与回放的 CNN 尾块输出桶不一致")
     elif args.normalize_short_tail_to_full_chunks:
         tensor_inputs, main_short_plan = _normalize_short_tail_to_full_chunks_inputs(
             reference_tensor_inputs, torch
@@ -1193,6 +1357,10 @@ def _run_target(args: argparse.Namespace) -> dict[str, Any]:
         specialization = _install_single_chunk_dynamic_audio_rewrite(
             thinker, tensor_inputs, torch
         )
+    elif args.direct_one_full_chunk_tail_bucket:
+        specialization = _install_one_full_chunk_dynamic_audio_rewrite(
+            thinker, tensor_inputs, torch
+        )
     elif args.dynamic_shapes:
         specialization = _install_dynamic_audio_shape_rewrite(
             thinker,
@@ -1314,6 +1482,51 @@ def _run_target(args: argparse.Namespace) -> dict[str, Any]:
                 },
                 "text_tokens": {"min": text_min, "max": text_max},
             }
+        elif args.direct_one_full_chunk_tail_bucket:
+            output_length = direct_one_full_chunk_bucket_plan["tail_output_length"]
+            tail_min = direct_one_full_chunk_bucket_plan["tail_bucket_start"]
+            tail_max = direct_one_full_chunk_bucket_plan["tail_bucket_end"]
+            audio_min = direct_one_full_chunk_bucket_plan["audio_frame_min"]
+            audio_max = direct_one_full_chunk_bucket_plan["audio_frame_max"]
+            if observed_full_chunks != {1}:
+                raise RuntimeError(
+                    "full1 动态帧维只允许 audio_full_chunks=1："
+                    f"{sorted(observed_full_chunks)}"
+                )
+            if min(observed_audio) < audio_min or max(observed_audio) > audio_max:
+                raise RuntimeError(
+                    "full1 音频帧数超出尾块输出桶 "
+                    f"[{audio_min}, {audio_max}]：{sorted(observed_audio)}"
+                )
+            audio_frames = torch.export.Dim(
+                "one_full_chunk_audio_frames", min=audio_min, max=audio_max
+            )
+            dynamic_shape_constraints = {
+                "batch_size": {"static": 1},
+                "mel_bins": {"static": dynamic_input_contract["mel_bins"]},
+                "audio_full_chunks": {"static": 1},
+                "audio_tail_frames": {
+                    "min": tail_min,
+                    "max": tail_max,
+                    "output_length": output_length,
+                    "dynamic": True,
+                },
+                "audio_frames": {
+                    "min": audio_min,
+                    "max": audio_max,
+                    "expression": f"{_DYNAMIC_AUDIO_WINDOW} + audio_tail_frames",
+                    "tail_frames_dynamic": True,
+                },
+                "padded_audio_frames": {
+                    "static": _DYNAMIC_AUDIO_WINDOW * 2
+                },
+                "retained_output_length": {
+                    "static": direct_one_full_chunk_bucket_plan[
+                        "retained_output_length"
+                    ]
+                },
+                "text_tokens": {"min": text_min, "max": text_max},
+            }
         else:
             audio_tail_frames = dynamic_input_contract["audio_tail_frames"]
             audio_full_chunks_min = _DYNAMIC_AUDIO_CHUNKS_MIN
@@ -1388,6 +1601,7 @@ def _run_target(args: argparse.Namespace) -> dict[str, Any]:
         args.canonicalize_tail_bucket
         or args.normalize_short_tail_to_full_chunks
         or args.direct_short_single_chunk_bucket
+        or args.direct_one_full_chunk_tail_bucket
     )
     if specialization is not None and not _comparison_passed(
         specialized_eager, require_exact_logits=require_exact_logits
@@ -1588,6 +1802,9 @@ def _run_target(args: argparse.Namespace) -> dict[str, Any]:
             "direct_short_single_chunk_bucket": (
                 args.direct_short_single_chunk_bucket
             ),
+            "direct_one_full_chunk_tail_bucket": (
+                args.direct_one_full_chunk_tail_bucket
+            ),
         },
         "dynamic_shape": {
             "enabled": args.dynamic_shapes,
@@ -1597,6 +1814,9 @@ def _run_target(args: argparse.Namespace) -> dict[str, Any]:
             "tail_bucket_canonicalization": tail_bucket_canonicalization,
             "short_tail_normalization": short_tail_normalization,
             "direct_short_bucket_plan": direct_short_bucket_plan,
+            "direct_one_full_chunk_bucket_plan": (
+                direct_one_full_chunk_bucket_plan
+            ),
             "shape_replay": shape_replay_report,
         },
         "eager": {
@@ -1686,6 +1906,14 @@ def main() -> int:
         help=(
             "仅用于动态 shape：full0 单 chunk 保持原始卷积宽度，"
             "在同一 CNN 输出桶内直接动态化 1～99 帧"
+        ),
+    )
+    target_parser.add_argument(
+        "--direct-one-full-chunk-tail-bucket",
+        action="store_true",
+        help=(
+            "仅用于动态 shape：full1 保持首个完整 chunk，并在同一 CNN 输出桶内"
+            "动态化非零尾帧；尾块按官方语义补到 100 帧后在 attention 前裁掉无效输出"
         ),
     )
     target_parser.add_argument(

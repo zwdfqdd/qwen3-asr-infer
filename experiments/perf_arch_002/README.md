@@ -286,44 +286,304 @@ rm -f /tmp/perf_arch_002_short_0p57.wav /tmp/perf_arch_002_short_0p64.wav
 目标 A10 实测两组 contract 均为 `audio_full_chunks=0`，帧数 57/64，CNN 输出长度均为 8；
 动态图范围为 57～64。桶 8 已通过六处 logits 逐位一致、最大差 0.0、timestamp argmax 一致、
 `torch.export(strict=True)` 及同图 57→64 回放门禁。终端末尾的 `swigvarlink`
-DeprecationWarning 是非致命退出警告。该结果只证明 full0 桶 8；随后仍需覆盖其余 12 个 full0
-桶，并单独处理 full1。剩余 full0 桶必须继续按独立进程、独立 strict export 顺序执行：
+DeprecationWarning 是非致命退出警告。
+
+随后输出桶 2～13 按独立进程、独立 strict export 顺序执行并 **11/11 通过**，端点分别为
+9→16、17→24、25→32、33→40、41→48、49→56、65→72、73→80、81→88、89→96、97→99；每桶
+`output_length` 与 `bucket_range` 均与声明一致，`export_root_side_effect_warning` 全部为
+`true`。因此 full0 动态覆盖为输出桶 2～13，即 9～99 帧；桶 1（1～8 帧）另按固定 profile 处理，
+full1 仍待独立验证。
+
+构造短音频有一个官方处理器硬约束：`WhisperFeatureExtractor` 走 `torch.stft`，`n_fft=400`
+且中心填充 200，要求波形采样点数大于 200。mel 帧数与采样点的关系是 `T = samples // 160`，
+因此 `T=1`（160 采样）会直接抛 `RuntimeError: Padding size should be less than the
+corresponding input dimension`，**官方链路无法构造 1 帧输入**。切片必须按精确采样点
+`T*160`，不能按秒近似。
+
+**输出桶 1 已确认无法动态导出。** 2→8 帧首轮在目标 A10 报
+`ConstraintViolationError(short_audio_frames)`，提示 `specialized it to be a constant (2)`；
+两组 eager 门禁之前的阶段没有数值问题，失败发生在 strict export 的 shape guard 生成。根因是
+桶 1 的 CNN 时间维最终为 1：`T∈[1,8]` 经三层 stride-2 卷积后输出长度恒为 `ceil(T/8)=1`，
+命中 PyTorch 的 0/1 维专门化，动态维因此被固化。该桶不能靠调整端点或放宽门禁绕过，只能另立
+固定 shape profile（`T=2…8` 共 7 个可达值）处理，且需独立验证，不得记为动态图已覆盖。
+
+因此本轮动态覆盖范围为输出桶 2～13，共 11 个桶，按独立进程、独立 strict export 顺序执行：
 
 ```bash
-for spec in \
-  "1 1 8" "2 9 16" "3 17 24" "4 25 32" "5 33 40" "6 41 48" \
-  "7 49 56" "9 65 72" "10 73 80" "11 81 88" "12 89 96" "13 97 99"
-do
-  set -- $spec
-  bucket="$1"; lo="$2"; hi="$3"
-  main="/tmp/perf_arch_002_short_${lo}.wav"
-  replay="/tmp/perf_arch_002_short_${hi}.wav"
-  report="performance-results/PERF-ARCH-002/target-export-dynamic-short-full0-bucket${bucket}-b1.json"
-  rm -f "$main" "$replay"
-  python -c 'import soundfile as sf,sys; p="test_data/bb7575d0c350726cc1e85d729ab261ac.wav"; x,sr=sf.read(p,dtype="float32"); sf.write(sys.argv[3],x[:round(sr*int(sys.argv[1])/100)],sr,subtype="FLOAT"); sf.write(sys.argv[4],x[:round(sr*int(sys.argv[2])/100)],sr,subtype="FLOAT")' "$lo" "$hi" "$main" "$replay"
-  python experiments/perf_arch_002/probe.py target \
-    --model models/qwen3-forced-aligner-0.6b/pt \
-    --audio "$main" \
-    --text test_data/bb7575d0c350726cc1e85d729ab261ac.txt \
-    --language Chinese \
-    --dynamic-shapes \
-    --specialize-text-mask \
-    --direct-short-single-chunk-bucket \
-    --replay-audio "$replay" \
-    --replay-text test_data/bb7575d0c350726cc1e85d729ab261ac.txt \
-    --output-json "$report" || { status=$?; rm -f "$main" "$replay"; exit "$status"; }
-  python -c 'import json,sys; r=json.load(open(sys.argv[1],encoding="utf-8")); d=r["dynamic_shape"]; p=d["direct_short_bucket_plan"]; print({"bucket":int(sys.argv[2]),"frames":[p["main_audio_frames"],p["shape_replay_audio_frames"]],"output_length":p["output_length"],"passed":r["summary"]["passed"],"export_root_warning":r["export"]["export_root_side_effect_warning"]})' "$report" "$bucket"
-  rm -f "$main" "$replay"
-done
+python - <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import soundfile as sf
+
+source = Path("test_data/bb7575d0c350726cc1e85d729ab261ac.wav")
+text = "test_data/bb7575d0c350726cc1e85d729ab261ac.txt"
+model = "models/qwen3-forced-aligner-0.6b/pt"
+hop_length = 160
+# 输出桶 1 已确认因 CNN 时间维为 1 触发 0/1 专门化而无法动态导出，改由固定 profile 另行处理。
+buckets = [
+    (2, 9, 16),
+    (3, 17, 24),
+    (4, 25, 32),
+    (5, 33, 40),
+    (6, 41, 48),
+    (7, 49, 56),
+    (9, 65, 72),
+    (10, 73, 80),
+    (11, 81, 88),
+    (12, 89, 96),
+    (13, 97, 99),
+]
+
+audio, sample_rate = sf.read(source, dtype="float32")
+if sample_rate != 16000:
+    raise SystemExit(f"探针要求 16 kHz 源音频，实际为 {sample_rate}")
+
+for bucket, main_frames, replay_frames in buckets:
+    main_audio = Path(f"/tmp/perf_arch_002_full0_{main_frames}.wav")
+    replay_audio = Path(f"/tmp/perf_arch_002_full0_{replay_frames}.wav")
+    report = Path(
+        "performance-results/PERF-ARCH-002/"
+        f"target-export-dynamic-short-full0-bucket{bucket}-b1.json"
+    )
+    try:
+        sf.write(
+            main_audio, audio[: main_frames * hop_length], sample_rate, subtype="FLOAT"
+        )
+        sf.write(
+            replay_audio,
+            audio[: replay_frames * hop_length],
+            sample_rate,
+            subtype="FLOAT",
+        )
+        print(
+            f"\n=== PERF-ARCH-002 full0 输出桶 {bucket}："
+            f"{main_frames}→{replay_frames} 帧 ===",
+            flush=True,
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "experiments/perf_arch_002/probe.py",
+                "target",
+                "--model", model,
+                "--audio", str(main_audio),
+                "--text", text,
+                "--language", "Chinese",
+                "--dynamic-shapes",
+                "--specialize-text-mask",
+                "--direct-short-single-chunk-bucket",
+                "--replay-audio", str(replay_audio),
+                "--replay-text", text,
+                "--output-json", str(report),
+            ]
+        )
+        if result.returncode != 0:
+            raise SystemExit(result.returncode)
+        data = json.loads(report.read_text(encoding="utf-8"))
+        plan = data["dynamic_shape"]["direct_short_bucket_plan"]
+        print(json.dumps({
+            "bucket": bucket,
+            "frames": [
+                plan["main_audio_frames"],
+                plan["shape_replay_audio_frames"],
+            ],
+            "output_length": plan["output_length"],
+            "bucket_range": [plan["bucket_start"], plan["bucket_end"]],
+            "passed": data["summary"]["passed"],
+            "export_root_warning": (
+                data["export"]["export_root_side_effect_warning"]
+            ),
+        }, ensure_ascii=False))
+    finally:
+        main_audio.unlink(missing_ok=True)
+        replay_audio.unlink(missing_ok=True)
+PY
 ```
+
+## 7. full0 输出桶 1 固定 shape profile
+
+桶 1 无法动态导出，但不需要新增探针模式。已通过的 T0 `--specialize-audio-shapes` 在
+`feature_length < 100` 时得到 `chunk_lengths=[T]`，`pad_sequence` 只有一个 chunk 因此不补帧，
+卷积宽度就是原始 `T`，`cu_seqlens=[0, ceil(T/8)]`——与 full0 原生单 chunk 路径等价。桶 1 因此
+用 `T=2…8` 共 7 个固定 shape 分别导出（`T=1` 官方处理器无法构造）：
+
+```bash
+python - <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import soundfile as sf
+
+source = Path("test_data/bb7575d0c350726cc1e85d729ab261ac.wav")
+text = "test_data/bb7575d0c350726cc1e85d729ab261ac.txt"
+model = "models/qwen3-forced-aligner-0.6b/pt"
+hop_length = 160
+
+audio, sample_rate = sf.read(source, dtype="float32")
+if sample_rate != 16000:
+    raise SystemExit(f"探针要求 16 kHz 源音频，实际为 {sample_rate}")
+
+for frames in range(2, 9):
+    clip = Path(f"/tmp/perf_arch_002_full0_fixed_{frames}.wav")
+    report = Path(
+        "performance-results/PERF-ARCH-002/"
+        f"target-export-fixed-short-full0-frames{frames}-b1.json"
+    )
+    try:
+        sf.write(clip, audio[: frames * hop_length], sample_rate, subtype="FLOAT")
+        print(
+            f"\n=== PERF-ARCH-002 full0 桶 1 固定 profile：{frames} 帧 ===",
+            flush=True,
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "experiments/perf_arch_002/probe.py",
+                "target",
+                "--model", model,
+                "--audio", str(clip),
+                "--text", text,
+                "--language", "Chinese",
+                "--specialize-audio-shapes",
+                "--specialize-text-mask",
+                "--output-json", str(report),
+            ]
+        )
+        if result.returncode != 0:
+            raise SystemExit(result.returncode)
+        data = json.loads(report.read_text(encoding="utf-8"))
+        plan = data["audio_shape_specialization"]["plan"]
+        comparisons = {
+            "audio": data["audio_shape_specialization"]["eager_comparison"],
+            "text_mask": data["text_mask_specialization"]["eager_comparison"],
+            "export_replay": data["export"]["replay"],
+        }
+        exact = {
+            name: {
+                "logits_identical": value["logits_identical"],
+                "max_abs_logit_delta": value["max_abs_logit_delta"],
+                "timestamp_buckets_identical": value["timestamp_buckets_identical"],
+            }
+            for name, value in comparisons.items()
+        }
+        print(json.dumps({
+            "frames": frames,
+            "chunk_lengths": plan["chunk_lengths"],
+            "aftercnn_length": plan["aftercnn_length"],
+            "cu_segments": plan["cu_segments"],
+            "passed": data["summary"]["passed"],
+            "export_root_warning": (
+                data["export"]["export_root_side_effect_warning"]
+            ),
+            "exact": exact,
+        }, ensure_ascii=False))
+        if not all(item["logits_identical"] for item in exact.values()):
+            raise SystemExit(f"{frames} 帧固定 profile 未达到 logits 逐位一致")
+    finally:
+        clip.unlink(missing_ok=True)
+PY
+```
+
+固定模式的探针门禁不强制逐位一致，因此上述编排额外从报告读取三处 `logits_identical`、
+`max_abs_logit_delta` 与 `timestamp_buckets_identical`，任一处非逐位一致即判失败。预期
+`chunk_lengths=[T]`、`aftercnn_length=1`、`cu_segments=[1]`。
+
+## 8. full1 同尾块输出桶动态图
+
+full1 输入为 `[100, tail]` 两个 chunk。官方 `pad_sequence` 因首块宽度为 100，会把尾块补到
+100 帧后分别卷积，再只保留尾块前 `ceil(tail/8)` 个 CNN 输出。新模式
+`--direct-one-full-chunk-tail-bucket` 固定卷积布局为 2×100 帧，在同一尾块输出桶内动态声明原始
+总帧数；进入 attention 前静态保留 `13 + tail_output_length` 个输出。它不跨 full0/full1 分支，
+也不改变真实卷积右边界。
+
+首轮只验证尾块输出桶 8：总帧数 157→164、tail 57→64，动态图范围 157～164：
+
+```bash
+python - <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import soundfile as sf
+
+source = Path("test_data/bb7575d0c350726cc1e85d729ab261ac.wav")
+text = "test_data/bb7575d0c350726cc1e85d729ab261ac.txt"
+model = "models/qwen3-forced-aligner-0.6b/pt"
+hop_length = 160
+main_frames, replay_frames = 157, 164
+main_audio = Path("/tmp/perf_arch_002_full1_157.wav")
+replay_audio = Path("/tmp/perf_arch_002_full1_164.wav")
+report = Path(
+    "performance-results/PERF-ARCH-002/"
+    "target-export-dynamic-short-full1-bucket8-b1.json"
+)
+
+audio, sample_rate = sf.read(source, dtype="float32")
+if sample_rate != 16000:
+    raise SystemExit(f"探针要求 16 kHz 源音频，实际为 {sample_rate}")
+try:
+    sf.write(
+        main_audio, audio[: main_frames * hop_length], sample_rate, subtype="FLOAT"
+    )
+    sf.write(
+        replay_audio,
+        audio[: replay_frames * hop_length],
+        sample_rate,
+        subtype="FLOAT",
+    )
+    result = subprocess.run([
+        sys.executable,
+        "experiments/perf_arch_002/probe.py",
+        "target",
+        "--model", model,
+        "--audio", str(main_audio),
+        "--text", text,
+        "--language", "Chinese",
+        "--dynamic-shapes",
+        "--specialize-text-mask",
+        "--direct-one-full-chunk-tail-bucket",
+        "--replay-audio", str(replay_audio),
+        "--replay-text", text,
+        "--output-json", str(report),
+    ])
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+    data = json.loads(report.read_text(encoding="utf-8"))
+    plan = data["dynamic_shape"]["direct_one_full_chunk_bucket_plan"]
+    print(json.dumps({
+        "main_contract": data["dynamic_shape"]["reference_main_contract"],
+        "replay_contract": data["dynamic_shape"]["shape_replay"]["reference_contract"],
+        "plan": plan,
+        "main_audio_eager": data["audio_shape_specialization"]["eager_comparison"],
+        "replay_audio_eager": data["dynamic_shape"]["shape_replay"]["audio_rewrite_comparison"],
+        "main_text_eager": data["text_mask_specialization"]["eager_comparison"],
+        "replay_text_eager": data["dynamic_shape"]["shape_replay"]["text_mask_comparison"],
+        "export": data["export"],
+        "summary": data["summary"],
+    }, ensure_ascii=False, indent=2))
+finally:
+    main_audio.unlink(missing_ok=True)
+    replay_audio.unlink(missing_ok=True)
+PY
+```
+
+通过条件仍为六处 logits 逐位一致、最大差 0.0、timestamp argmax 一致，strict 动态导出成功，
+同一图完成 157→164 帧回放，并保留 `_export_root` warning。首轮通过也只证明 full1 桶 8；随后
+再覆盖其余 12 个尾块输出桶。总帧数恰为 100（无尾块）不属于该模式，需单独固定 profile。
 
 ## 判定
 
-- **完整动态输入域通过**：13 个尾帧输出桶、完整 chunk 和 full0/full1 短音频均完成两组 eager
-  改写与同一 strict 动态图回放 timestamp argmax 门禁；然后才建立独立精确固定的
-  ONNX/TensorRT 环境。
+- **完整生产输入域导出通过**：完整 chunk、full0/full1 短音频均由已验证的 strict 动态图或固定
+  profile 覆盖；所有路径完成 eager 改写、导出回放和 timestamp argmax 门禁，然后才建立独立
+  精确固定的 ONNX/TensorRT 环境。不得把 full0 桶 1 的固定 profile 描述为动态图。
 - **动态不通过**：保留首个阻塞算子、shape 约束或数据相关控制流，不静默降级，不重复固定实验。
-- 即使动态 shape 通过，也不能进入服务集成；后续仍需 11 语种 oracle、逐项 1 ms、batch
+- 即使输入域导出通过，也不能进入服务集成；后续仍需 11 语种 oracle、逐项 1 ms、batch
   1/8/16/32 原始性能、端到端 +20%、成功率 100% 和故障门禁。
 
 ## 当前状态
@@ -333,9 +593,9 @@ done
   0.0。动态首轮任意帧范围在 shape guard 阶段失败；收紧到 2～32 个完整 100 帧 chunk 后，
   10 秒与 7 秒的改写 eager、strict 动态导出和同一图双 shape 回放已全部通过。固定尾帧 T1.1
   也已通过一个余数 profile；T1.2 已在目标 A10 完成 13/13 个 CNN 输出桶，全部六处 logits
-  比较逐位一致、最大差 0.0，timestamp argmax 一致。T1.3 首个完整 chunk 规范化候选已因
-  full0 回放最大差 1.4296875 且 timestamp argmax 不一致被拒绝；full0 原生单 chunk 动态
-  宽度探针的目标 A10 桶 8（57→64 帧）已通过六处逐位 logits、timestamp argmax、strict
-  export 和同图回放门禁。该结果只覆盖桶 8；full0 其余 12 桶与 full1 分域通过前仍不进入
-  ONNX/TensorRT。
+  比较逐位一致、最大差 0.0，timestamp argmax 一致。T1.3 首个 0/1 chunk 统一规范化候选已因
+  full0 回放最大差 1.4296875 且 timestamp argmax 不一致被拒绝。full0 已闭合：9～99 帧由
+  输出桶 2～13 动态图 11/11 覆盖，2～8 帧由固定 profile 7/7 覆盖，`T=1` 官方处理器无法构造；
+  所有通过轮次均逐位一致、最大差 0.0，并保留 `_export_root` warning。full1 同尾块输出桶动态
+  模式已实现，首轮待目标 A10 验证 157→164 帧的尾块输出桶 8；通过前仍不进入 ONNX/TensorRT。
 - 生产链：保持 PyTorch ForcedAligner、batch=32 和现有可选 MPS，不做静默切换。
