@@ -14,8 +14,8 @@
   `cf1c50164ea3ac48240d12bef5ead74aee0720cc`。
 - CPU 保留官方 `encode_timestamp()`、processor、timestamp token mask、`parse_timestamp()`、
   单调性和边界校验；候选编译范围只覆盖 `model.thinker(...).logits`。
-- 当前只评估 FP16。固定 shape 已通过，现推进动态 shape T1；BF16、INT8 W8A8、TensorRT
-  profile 和独立服务仍须在动态导出边界明确后另行推进。
+- 当前只评估 FP16。固定与动态 `torch.export` 已覆盖实际可达的 2～3200 帧输入域；下一步只在
+  独立精确固定环境验证 ONNX/TensorRT parser 与 engine。BF16、INT8 W8A8 和独立服务后续另行推进。
 - 11 语种、逐项 1 ms、成功率 100% 和原始吞吐 +30% 门禁不放宽。
 - 报告、音频、文本和导出图可能包含样本派生信息，不提交 Git。
 
@@ -501,7 +501,7 @@ full1 输入为 `[100, tail]` 两个 chunk。官方 `pad_sequence` 因首块宽�
 总帧数；进入 attention 前静态保留 `13 + tail_output_length` 个输出。它不跨 full0/full1 分支，
 也不改变真实卷积右边界。
 
-首轮只验证尾块输出桶 8：总帧数 157→164、tail 57→64，动态图范围 157～164：
+首轮验证尾块输出桶 8：总帧数 157→164、tail 57→64，动态图范围 157～164：
 
 ```bash
 python - <<'PY'
@@ -573,9 +573,206 @@ finally:
 PY
 ```
 
-通过条件仍为六处 logits 逐位一致、最大差 0.0、timestamp argmax 一致，strict 动态导出成功，
-同一图完成 157→164 帧回放，并保留 `_export_root` warning。首轮通过也只证明 full1 桶 8；随后
-再覆盖其余 12 个尾块输出桶。总帧数恰为 100（无尾块）不属于该模式，需单独固定 profile。
+目标 A10 实测通过：主/replay contract 分别为总帧 157/164、`audio_full_chunks=1`、tail 57/64；
+计划固定补到 200 帧卷积并保留 21 个输出。主/回放音频改写、文本 mask、strict 导出图回放共
+六处 logits 均逐位一致、最大差 0.0，timestamp argmax 一致，157→164 同图回放成功；
+`export_root_side_effect_warning=true`。该结果只证明 full1 桶 8。
+
+其余 12 个 full1 尾块输出桶继续按独立进程、独立 strict export 顺序执行：
+
+```bash
+python - <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import soundfile as sf
+
+source = Path("test_data/bb7575d0c350726cc1e85d729ab261ac.wav")
+text = "test_data/bb7575d0c350726cc1e85d729ab261ac.txt"
+model = "models/qwen3-forced-aligner-0.6b/pt"
+hop_length = 160
+buckets = [
+    (1, 1, 8),
+    (2, 9, 16),
+    (3, 17, 24),
+    (4, 25, 32),
+    (5, 33, 40),
+    (6, 41, 48),
+    (7, 49, 56),
+    (9, 65, 72),
+    (10, 73, 80),
+    (11, 81, 88),
+    (12, 89, 96),
+    (13, 97, 99),
+]
+
+audio, sample_rate = sf.read(source, dtype="float32")
+if sample_rate != 16000:
+    raise SystemExit(f"探针要求 16 kHz 源音频，实际为 {sample_rate}")
+
+for bucket, main_tail, replay_tail in buckets:
+    main_frames = 100 + main_tail
+    replay_frames = 100 + replay_tail
+    main_audio = Path(f"/tmp/perf_arch_002_full1_{main_frames}.wav")
+    replay_audio = Path(f"/tmp/perf_arch_002_full1_{replay_frames}.wav")
+    report = Path(
+        "performance-results/PERF-ARCH-002/"
+        f"target-export-dynamic-short-full1-bucket{bucket}-b1.json"
+    )
+    try:
+        sf.write(
+            main_audio, audio[: main_frames * hop_length], sample_rate, subtype="FLOAT"
+        )
+        sf.write(
+            replay_audio,
+            audio[: replay_frames * hop_length],
+            sample_rate,
+            subtype="FLOAT",
+        )
+        print(
+            f"\n=== PERF-ARCH-002 full1 尾块输出桶 {bucket}："
+            f"{main_frames}→{replay_frames} 帧 ===",
+            flush=True,
+        )
+        result = subprocess.run([
+            sys.executable,
+            "experiments/perf_arch_002/probe.py",
+            "target",
+            "--model", model,
+            "--audio", str(main_audio),
+            "--text", text,
+            "--language", "Chinese",
+            "--dynamic-shapes",
+            "--specialize-text-mask",
+            "--direct-one-full-chunk-tail-bucket",
+            "--replay-audio", str(replay_audio),
+            "--replay-text", text,
+            "--output-json", str(report),
+        ])
+        if result.returncode != 0:
+            raise SystemExit(result.returncode)
+        data = json.loads(report.read_text(encoding="utf-8"))
+        plan = data["dynamic_shape"]["direct_one_full_chunk_bucket_plan"]
+        print(json.dumps({
+            "bucket": bucket,
+            "frames": [plan["main_audio_frames"], plan["shape_replay_audio_frames"]],
+            "tails": [plan["main_tail_frames"], plan["shape_replay_tail_frames"]],
+            "tail_output_length": plan["tail_output_length"],
+            "audio_frame_range": [plan["audio_frame_min"], plan["audio_frame_max"]],
+            "retained_output_length": plan["retained_output_length"],
+            "passed": data["summary"]["passed"],
+            "export_root_warning": (
+                data["export"]["export_root_side_effect_warning"]
+            ),
+        }, ensure_ascii=False))
+    finally:
+        main_audio.unlink(missing_ok=True)
+        replay_audio.unlink(missing_ok=True)
+PY
+```
+
+其余 12 桶随后按独立进程、独立 strict export 顺序执行并 **12/12 通过**。最终 full1 的
+13/13 个尾块输出桶全部通过，覆盖总帧 101～199；`tail_output_length` 连续覆盖 1～13，
+`retained_output_length` 连续覆盖 14～26。每轮 `audio_frame_range`、主/replay 帧数及 tail 均与
+声明一致，六处逐位 logits、timestamp argmax、strict 同图回放门禁全部满足，且
+`export_root_side_effect_warning=true`。
+
+总帧数恰为 100（无尾块）不属于该模式；目标 A10 的独立固定 profile 已通过，2～3200 帧导出输入域至此闭合。
+
+## 9. 总帧 100 固定 shape profile
+
+总帧恰为 100 时既没有尾块，也达不到完整 chunk 动态模式的 2 chunk 下限。该点无需新增探针
+模式，直接复用已通过的 `--specialize-audio-shapes --specialize-text-mask` 固定路径。目标 A10
+已按精确 `100*160` 个采样点构造输入，并由编排脚本额外强制三处 logits 逐位一致：
+
+```bash
+python - <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import soundfile as sf
+
+source = Path("test_data/bb7575d0c350726cc1e85d729ab261ac.wav")
+text = "test_data/bb7575d0c350726cc1e85d729ab261ac.txt"
+model = "models/qwen3-forced-aligner-0.6b/pt"
+clip = Path("/tmp/perf_arch_002_fixed_100frames.wav")
+report = Path(
+    "performance-results/PERF-ARCH-002/target-export-fixed-100frames-b1.json"
+)
+
+audio, sample_rate = sf.read(source, dtype="float32")
+if sample_rate != 16000:
+    raise SystemExit(f"探针要求 16 kHz 源音频，实际为 {sample_rate}")
+if len(audio) < 100 * 160:
+    raise SystemExit("源音频不足 100 个 mel 帧")
+
+try:
+    sf.write(clip, audio[: 100 * 160], sample_rate, subtype="FLOAT")
+    result = subprocess.run([
+        sys.executable,
+        "experiments/perf_arch_002/probe.py",
+        "target",
+        "--model", model,
+        "--audio", str(clip),
+        "--text", text,
+        "--language", "Chinese",
+        "--specialize-audio-shapes",
+        "--specialize-text-mask",
+        "--output-json", str(report),
+    ])
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+
+    data = json.loads(report.read_text(encoding="utf-8"))
+    plan = data["audio_shape_specialization"]["plan"]
+    comparisons = {
+        "audio": data["audio_shape_specialization"]["eager_comparison"],
+        "text_mask": data["text_mask_specialization"]["eager_comparison"],
+        "export_replay": data["export"]["replay"],
+    }
+    exact = all(
+        item["logits_identical"]
+        and item["max_abs_logit_delta"] == 0.0
+        and item["timestamp_buckets_identical"]
+        for item in comparisons.values()
+    )
+    contract_ok = (
+        plan["feature_length"] == 100
+        and plan["chunk_lengths"] == [100]
+        and plan["aftercnn_length"] == 13
+        and plan["cu_segments"] == [13]
+    )
+    passed = (
+        data["summary"]["passed"]
+        and data["summary"]["fixed_shape_export"] is True
+        and data["export"]["passed"]
+        and contract_ok
+        and exact
+    )
+    print(json.dumps({
+        "plan": plan,
+        "comparisons": comparisons,
+        "summary": data["summary"],
+        "export_root_warning": data["export"]["export_root_side_effect_warning"],
+        "passed": passed,
+    }, ensure_ascii=False, indent=2))
+    if not passed:
+        raise SystemExit("100 帧固定 profile 未通过精确门禁")
+finally:
+    clip.unlink(missing_ok=True)
+PY
+```
+
+目标 A10 实测计划为 `chunk_lengths=[100]`、`aftercnn_length=13`、`cu_segments=[13]`；音频
+改写、文本 mask 改写和导出回放三处均为 `logits_identical=true`、`max_abs_logit_delta=0.0`，
+timestamp argmax 一致，`summary.fixed_shape_export=true`。`torch.export(strict=True)` 成功，
+`_export_root` potential side-effect warning 继续留证。实际可达的 2～3200 帧导出输入域至此闭合；
+1 帧仍属于官方处理器无法构造的域外输入，full0 桶 1 仍只能描述为 2～8 帧固定 profile，不得
+写成动态图。
 
 ## 判定
 
@@ -597,5 +794,9 @@ PY
   full0 回放最大差 1.4296875 且 timestamp argmax 不一致被拒绝。full0 已闭合：9～99 帧由
   输出桶 2～13 动态图 11/11 覆盖，2～8 帧由固定 profile 7/7 覆盖，`T=1` 官方处理器无法构造；
   所有通过轮次均逐位一致、最大差 0.0，并保留 `_export_root` warning。full1 同尾块输出桶动态
-  模式已实现，首轮待目标 A10 验证 157→164 帧的尾块输出桶 8；通过前仍不进入 ONNX/TensorRT。
+  模式的首轮桶 8 已在目标 A10 通过：157→164 帧、tail 57→64、固定补到 200 帧并保留 21 个
+  CNN 输出，六处逐位一致且同图回放成功。其余 12 桶随后也全部通过，full1 最终 13/13 覆盖
+  101～199 帧，保留输出长度连续 14～26，每轮均记录 `_export_root` warning。总帧 100 的固定
+  profile 随后也以 `chunk_lengths=[100]`、CNN 后长度 13、三处 logits 零差通过。实际可达的
+  2～3200 帧 `torch.export` 输入域已闭合；下一步转入独立精确固定的 ONNX/TensorRT 环境。
 - 生产链：保持 PyTorch ForcedAligner、batch=32 和现有可选 MPS，不做静默切换。
