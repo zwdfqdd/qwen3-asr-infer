@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "samples": [
+    {"id": "chinese-01", "language": "Chinese", "audio": "test_data/phase_a/chinese.wav", "text": "test_data/phase_a/chinese.txt"},
+    {"id": "english-01", "language": "English", "audio": "test_data/phase_a/english.wav", "text": "test_data/phase_a/english.txt"},
+    {"id": "cantonese-01", "language": "Cantonese", "audio": "test_data/phase_a/cantonese.wav", "text": "test_data/phase_a/cantonese.txt"},
+    {"id": "french-01", "language": "French", "audio": "test_data/phase_a/french.wav", "text": "test_data/phase_a/french.txt"},
+    {"id": "german-01", "language": "German", "audio": "test_data/phase_a/german.wav", "text": "test_data/phase_a/german.txt"},
+    {"id": "italian-01", "language": "Italian", "audio": "test_data/phase_a/italian.wav", "text": "test_data/phase_a/italian.txt"},
+    {"id": "japanese-01", "language": "Japanese", "audio": "test_data/phase_a/japanese.wav", "text": "test_data/phase_a/japanese.txt"},
+    {"id": "korean-01", "language": "Korean", "audio": "test_data/phase_a/korean.wav", "text": "test_data/phase_a/korean.txt"},
+    {"id": "portuguese-01", "language": "Portuguese", "audio": "test_data/phase_a/portuguese.wav", "text": "test_data/phase_a/portuguese.txt"},
+    {"id": "russian-01", "language": "Russian", "audio": "test_data/phase_a/russian.wav", "text": "test_data/phase_a/russian.txt"},
+    {"id": "spanish-01", "language": "Spanish", "audio": "test_data/phase_a/spanish.wav", "text": "test_data/phase_a/spanish.txt"}
+  ]
+}

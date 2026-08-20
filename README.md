@@ -136,7 +136,7 @@ Chat/多模态预处理触发的 `RuntimeError: Already borrowed` 和上游 HTTP
 ASR-only 三轮累计 8000/8000。正式三轮中位数为 114.18 QPS、1141.75 audio_s/s、平均延迟
 824.0 ms、P95 1055.5 ms、P99 1606.0 ms。默认时间戳六轮中位数为 11.005 QPS、110.025
 audio_s/s，当前确定瓶颈是串行同卡 Aligner，而不是 ASR 数据面。`dev` 已实现 Aligner
-有界跨请求动态微批；生产默认仍保持 `ALIGNER_CONCURRENCY=1`、`ALIGNER_BATCH_SIZE=1`。目标
+有界跨请求动态微批；生产默认为 `ALIGNER_CONCURRENCY=1`、`ALIGNER_BATCH_SIZE=32`。目标
 A10 的 batch=4/8/16/32 单轮性能诊断均达到数值晋级线，其中 batch=32 达到 220.03
 audio_s/s、P95 4641.8 ms、P99 5585.0 ms，当前是最佳平衡候选。batch=48 虽升至 228.99
 audio_s/s，但仅增加 4.1%、P95 恶化 4.9%、显存升至 21821 MiB，已越过工程晋级拐点。
@@ -149,10 +149,36 @@ attention=auto 已确认实际使用 SDPA，当前固定镜像缺少 `flash_attn
 未达到晋级线，已拒绝并恢复 1，不再测试其他线程数。`dev` 随后实现默认关闭的有界预解码；
 目标 A10 中预解码命中率 100%、残余等待仅 0.01 ms、批内解码降至 0.03 ms，但同卡
 `model.align()` 从 1097.04 增至 1351.02 ms，吞吐仅 +1.84%、P95 -1.58%，仍未晋级并恢复关闭。
-官方 `align()` 已使用 `torch.inference_mode()`，单卡软件路线收敛；下一步只能验证独立 Aligner
-GPU/实例拓扑。重复性、时间戳、混合流量与 CER 门禁完成前，不得修改生产默认值。历史 A10 纯 90 秒
-测试中 `3/96` 吞吐最高；仍须在 0～7500 秒真实混合流量下复测。详细数据和方法见
-[性能调优](docs/性能调优.md)。
+官方 `align()` 已使用 `torch.inference_mode()`。后续 vLLM token-classify 路线虽取得 +188.1%
+原始吞吐，但生产 oracle 仅 6/11，继续逐层修复不划算，`PERF-ARCH-001` 已拒绝且不再重复 spike。
+当前 `PERF-ARCH-002` TensorRT FP16 已完成固定 batch=1、固定 shape 探针：音频改写、文本
+mask 改写和 strict 导出图回放的 logits 最大差均为 0.0，timestamp argmax 完全一致；捕获时的
+`_export_root` potential side-effect warning 已留证。动态 T1 首轮的 10 秒/7 秒 eager 门禁通过，
+但任意 100～3200 帧声明在 strict shape guard 阶段失败；收紧为 2～32 个完整 100 帧 chunk
+后，10 秒/7 秒改写 eager、strict 动态导出和同一图双 shape 回放均已通过。T1.1 已实现固定
+尾帧余数、动态完整 chunk 数的尾块图；1.602188 秒首轮因 `audio_full_chunks=1` 被专门化而
+失败；将下限固定为 2 后，11.334188 秒→追加 1 秒静音的 T1.1 strict 动态导出与异 shape
+回放已通过。该结果只证明一个固定尾帧余数 profile。T1.2 随后在目标 A10 通过同 CNN 输出
+长度桶规范化：原始主输入为 1133 帧（11 个完整 chunk + tail=33），候选补 7 帧到 1140；原始
+回放为 1237 帧（12 个完整 chunk + tail=37），候选补 3 帧到 1240。两者 CNN 尾块输出长度均为
+5，canonical tail 均为 40。主/回放的音频改写、文本 mask、strict 动态图回放共六处比较均
+logits 逐位一致、最大差 0.0，36 个 timestamp bucket argmax 全部一致，
+`summary.dynamic_shape_export=true`。输出桶 13 边界随后也通过：原始 1197/1298 帧、
+tail=97/98 分别补 2/1 帧到候选 1199/1299，canonical tail=99、CNN 输出长度 13；
+`tail_padding=1`、`tail_output_drop=0`。六处 logits 同样逐位一致、最大差 0.0，timestamp
+argmax 完全一致。输出桶 1 最大裁剪边界也已通过：原始 1201/1308 帧、tail=1/8，候选
+1208/1308 帧、canonical tail=8、CNN 输出长度 1；`tail_padding=92`、`tail_output_drop=12`。
+六处 logits 仍逐位一致、最大差 0.0。其余 10 桶随后按独立 strict export 顺序执行并 10/10
+通过；至此 13/13 个 CNN 输出桶均保持六处 logits 逐位一致、最大差 0.0、timestamp argmax 一致，
+且都保留 `_export_root` potential side-effect warning。T1.2 已覆盖 `audio_full_chunks≥2` 下的
+1～99 非零尾帧余数。短音频 T1.3 的首个完整 chunk 规范化候选已被目标 A10 拒绝：160 帧
+full1 主输入最大差 0.0，但 60 帧 full0 回放最大差 1.4296875 且 timestamp argmax 不一致。
+官方 `<100` 帧单 chunk 会直接按原始宽度执行卷积，补到 100 后再裁输出无法恢复右边界语义。
+现有 full0 原生单 chunk 动态宽度探针不补帧、不裁剪；目标 A10 首轮同桶 8 的 57→64 帧
+已通过逐位 logits、timestamp argmax、strict export 和同图异 shape 回放门禁。该结果只覆盖桶 8；
+full0 其余 12 桶及 full1 分域通过前仍不安装 ONNX/TensorRT、不修改生产路径。生产继续保持 PyTorch
+ForcedAligner、batch=32 和可选 MPS。历史 A10 纯 90 秒测试中 `3/96` 吞吐最高；仍须在
+0～7500 秒真实混合流量下复测。详细数据和方法见 [性能调优](docs/性能调优.md)。
 
 ## 文档
 
