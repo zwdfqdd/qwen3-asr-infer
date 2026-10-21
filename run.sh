@@ -32,10 +32,11 @@ export LOG_BACKUP_COUNT="${LOG_BACKUP_COUNT:-7}"  # 最多保留的大小轮转�
 export LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"  # 启动时清理超过该天数的旧日志。
 export LOG_QUEUE_SIZE="${LOG_QUEUE_SIZE:-10000}"  # 异步日志队列容量；满时丢弃并上报计数。
 
-# ASR 模型下载：仅从 ModelScope 固定 revision 下载到独立本地目录。
+# 主模型来源：modelscope 同步官方固定 revision；local 只读验真本地微调模型，绝不联网或覆盖。
+export VLLM_MODEL_SOURCE="${VLLM_MODEL_SOURCE:-modelscope}"
 export VLLM_MODEL_ID="${VLLM_MODEL_ID:-Qwen/Qwen3-ASR-0.6B}"  # ModelScope 主模型仓库 ID。
-export VLLM_MODEL_DIR="${VLLM_MODEL_DIR:-models/qwen3-asr-0.6b/vllm}"  # 主模型持久化目录。
-export MODELSCOPE_REVISION="${MODELSCOPE_REVISION:-4ce9cc728b473a5aedbe7b6e1ea45646316824dc}"  # 固定提交 revision。
+export VLLM_MODEL_DIR="${VLLM_MODEL_DIR:-models/qwen3-asr-0.6b/vllm}"  # 主模型目录。
+export MODELSCOPE_REVISION="${MODELSCOPE_REVISION:-4ce9cc728b473a5aedbe7b6e1ea45646316824dc}"  # 官方固定 revision。
 
 # vLLM 引擎与调度：精度/权重格式、显存比例、token/序列预算、音频文件保护及启动超时。
 export DTYPE="${DTYPE:-bfloat16}"  # GPU 计算精度；A10 默认 bfloat16。
@@ -51,12 +52,11 @@ export VLLM_ATTENTION_BACKEND_NAME="${VLLM_ATTENTION_BACKEND_NAME:-FLASH_ATTN}" 
 export VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-600}"  # 等待 /health 就绪的总秒数。
 
 # 网关音频与请求限制。大小单位为 MiB，时长单位为秒，并发项单位为任务数。
-# 字节上限按 7500 秒 16 kHz 单声道 PCM16 WAV 推导：240,000,044 B 约 228.88 MiB → 229 MiB；
-# Base64 膨胀 4/3 后约 305.18 MiB，加 JSON 字段与热词开销 → 308 MiB。三项互相绑定。
+# Base64 约膨胀 1/3，因此 280 MiB JSON 请求体会先于同值的解码后音频上限触发。
 export AUDIO_CHUNK_SECONDS="${AUDIO_CHUNK_SECONDS:-32}"  # 长音频单个物理分片的最长秒数。
-export MAX_AUDIO_SECONDS="${MAX_AUDIO_SECONDS:-7500}"  # 解码后按采样帧计算的最大总秒数。
-export MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-229}"  # 解码后音频或 multipart 文件上限，MiB。
-export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-308}"  # 完整 Base64 JSON 请求体上限，MiB。
+export MAX_AUDIO_SECONDS="${MAX_AUDIO_SECONDS:-2000}"  # 解码后按采样帧计算的最大总秒数。
+export MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-280}"  # 解码后音频或 multipart 文件上限，MiB。
+export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-280}"  # 完整 Base64 JSON 请求体上限，MiB。
 export CHUNK_CONCURRENCY="${CHUNK_CONCURRENCY:-3}"  # 单个长请求最多并发提交的分片数。
 export LONG_CHUNKS_IN_FLIGHT="${LONG_CHUNKS_IN_FLIGHT:-96}"  # 全局长音频分片在途任务上限。
 export BACKEND_TIMEOUT="${BACKEND_TIMEOUT:-300}"  # 每个 vLLM 分片 HTTP 请求超时秒数。
@@ -81,31 +81,12 @@ export ALIGNER_DEVICE="${ALIGNER_DEVICE:-cuda:0}"  # Aligner 执行设备，如 
 export ALIGNER_DTYPE="${ALIGNER_DTYPE:-bfloat16}"  # Aligner 精度；CPU 必须使用 float32。
 export ALIGNER_ATTENTION_BACKEND="${ALIGNER_ATTENTION_BACKEND:-auto}"  # auto 保持 Transformers 自动选择；可实验 sdpa/flash_attention_2。
 export ALIGNER_CONCURRENCY="${ALIGNER_CONCURRENCY:-1}"  # 并发模型 worker 数；共享模型需验证线程安全。
-# batch=32 为目标 A10 实测最佳平衡：端到端由 107.33 升至 228.57 audio_s/s，显存峰值约 20315 MiB。
-# batch=48 因收益不足 5% 且显存再增被拒；batch=1 保留为逐片回滚值。
-export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-32}"  # 单次模型调用跨请求合并的最大物理分片数。
+export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-1}"  # 单次模型调用跨请求合并的最大物理分片数。
 export ALIGNER_DECODE_WORKERS="${ALIGNER_DECODE_WORKERS:-1}"  # 每批 WAV 并行解码线程上限；1 保留串行回滚。
 export ALIGNER_PREDECODE_ENABLED="${ALIGNER_PREDECODE_ENABLED:-false}"  # 是否在 ASR 阶段提前有界解码 PCM。
 export ALIGNER_PREDECODE_MAX_MB="${ALIGNER_PREDECODE_MAX_MB:-128}"  # 全局已解码 PCM 驻留预算，MiB。
 export ALIGNER_BATCH_WAIT_MS="${ALIGNER_BATCH_WAIT_MS:-5}"  # 首条分片入队后的最大动态合批等待毫秒数。
 export ALIGNER_QUEUE_SIZE="${ALIGNER_QUEUE_SIZE:-256}"  # 有界对齐分片队列容量。
-# 分片级流水：分片 ASR 完成即提交对齐。已实测拒绝，因为它与动态微批目标相反，会打散批次；
-# 保留开关仅为 Aligner 迁移到由 vLLM 调度器管理合批后重新实测之用。生产保持 false。
-export ALIGNER_PIPELINE_ENABLED="${ALIGNER_PIPELINE_ENABLED:-false}"  # 是否启用分片级对齐流水。
-
-# NVIDIA MPS：让 vLLM 与 Aligner 两个 CUDA 进程的 kernel 并发执行，实测端到端 +19.97%。
-# 说明：上面的分片级流水已实测拒绝（并发 96/4/1 为 -1.52%/+0.84%/+5.26%），它会打散动态微批，
-# 并发 1 时批次由 1 个变 4 个、对齐阶段 +134.9%。保持关闭；详见 docs/性能实验台账.md。
-# MPS 是宿主级透明特性：只要控制守护进程在运行且管道目录可达，任何 CUDA 进程都会自动作为
-# MPS 客户端接入；未设置 CUDA_MPS_PIPE_DIRECTORY 时运行时仍会查默认 /tmp/nvidia-mps。
-# 因此仅靠环境变量无法决定是否走 MPS，本脚本改为按 ENABLE_MPS 主动管理守护进程生命周期：
-#   true  且守护进程不在线 → 启动它；已在线则直接复用。
-#   false 且守护进程在线   → 在确认没有活跃客户端后停止它，使进程使用独立上下文。
-# 实测两个方向的不一致都会让端到端吞吐相差约 20%，且全部健康指标正常、无任何告警，
-# 因此不允许带着与配置不符的状态继续启动。
-export ENABLE_MPS="${ENABLE_MPS:-false}"  # 是否通过 NVIDIA MPS 运行两个 CUDA 进程。
-export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}"  # MPS 命名管道目录。
-export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log}"  # MPS 控制日志目录。
 
 # 参数：待判断的布尔文本；true/1/yes/on（不区分大小写）视为开启。
 enabled() {
@@ -114,53 +95,6 @@ enabled() {
     *) return 1 ;;
   esac
 }
-
-# 返回 0 表示 MPS 控制守护进程可响应；不解析客户端列表格式，只判定守护进程是否存在。
-mps_daemon_ready() {
-  local output
-  output="$(echo get_server_list | nvidia-cuda-mps-control 2>&1)" || return 1
-  [[ "$output" != *"Cannot find MPS control daemon"* ]]
-}
-
-# 返回 0 表示至少已创建一个 MPS server。server 由首个客户端接入时创建，并在最后一个客户端
-# 退出后消失，因此它既是“确实有进程走 MPS”的信号，也是“仍有活跃客户端”的判据，
-# 比解析 get_device_client_list 的非结构化输出稳定。
-mps_server_ready() {
-  local output
-  output="$(echo get_server_list | nvidia-cuda-mps-control 2>/dev/null)" || return 1
-  [[ -n "${output//[[:space:]]/}" ]]
-}
-
-# 启动控制守护进程并等待其可响应；成功返回 0。
-mps_start_daemon() {
-  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY" || return 1
-  nvidia-cuda-mps-control -d >/dev/null 2>&1 || return 1
-  local attempt
-  for attempt in $(seq 1 20); do
-    mps_daemon_ready && return 0
-    sleep 0.5
-  done
-  return 1
-}
-
-# 停止控制守护进程。返回 2 表示存在活跃客户端而拒绝停止；返回 1 表示停止失败。
-# quit 在仍有客户端连接时会阻塞等待，因此必须先判定 server 状态并加超时兜底。
-mps_stop_daemon() {
-  mps_server_ready && return 2
-  timeout 30 bash -c 'echo quit | nvidia-cuda-mps-control' >/dev/null 2>&1 || return 1
-  local attempt
-  for attempt in $(seq 1 20); do
-    mps_daemon_ready || return 0
-    sleep 0.5
-  done
-  return 1
-}
-
-if enabled "$ENABLE_MPS" && ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
-  echo "配置错误：ENABLE_MPS=true，但当前环境没有 nvidia-cuda-mps-control。" >&2
-  echo "请改为 ENABLE_MPS=false，或使用包含 MPS 控制工具的镜像重新部署。" >&2
-  exit 1
-fi
 
 if enabled "$ENABLE_WORD_TIMESTAMP" || enabled "$ENABLE_SENTENCE_TIMESTAMP"; then
   if [[ "$ALIGNER_ATTENTION_BACKEND" == "flash_attention_2" ]]; then
@@ -197,56 +131,6 @@ fi
 check_port_available "$VLLM_HOST" "$VLLM_PORT" "vLLM 后端"
 check_port_available "$GATEWAY_HOST" "$GATEWAY_PORT" "对外网关"
 
-# MPS 守护进程状态调整。它会改变宿主/容器级共享状态，因此放在端口等快速失败校验之后，
-# 避免因这些校验退出而遗留与配置不符的守护进程状态。
-if ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
-  echo "MPS 状态：环境未提供 nvidia-cuda-mps-control，CUDA 进程使用各自独立上下文。"
-elif enabled "$ENABLE_MPS"; then
-  if mps_daemon_ready; then
-    echo "MPS 状态：守护进程已在线，直接复用（$CUDA_MPS_PIPE_DIRECTORY）。"
-  else
-    echo "MPS 状态：守护进程不在线，正在按 ENABLE_MPS=true 启动……"
-    if ! mps_start_daemon; then
-      echo "启动失败：无法拉起 MPS 控制守护进程。" >&2
-      echo "管道目录：$CUDA_MPS_PIPE_DIRECTORY，日志目录：$CUDA_MPS_LOG_DIRECTORY" >&2
-      echo "容器需以 --ipc=host 运行；请检查权限与 $CUDA_MPS_LOG_DIRECTORY/control.log。" >&2
-      exit 1
-    fi
-    echo "MPS 状态：守护进程已启动（$CUDA_MPS_PIPE_DIRECTORY）。"
-  fi
-elif mps_daemon_ready; then
-  if ! command -v timeout >/dev/null 2>&1; then
-    echo "配置错误：ENABLE_MPS=false 且守护进程在线，但环境缺少 timeout 命令。" >&2
-    echo "停止守护进程需要超时兜底，因为 quit 在仍有客户端时会无限等待。" >&2
-    echo "请安装 coreutils，或手工执行：echo quit | nvidia-cuda-mps-control" >&2
-    exit 1
-  fi
-  echo "MPS 状态：守护进程在线但 ENABLE_MPS=false，正在停止……"
-  set +e
-  mps_stop_daemon
-  mps_stop_status=$?
-  set -e
-  case "$mps_stop_status" in
-    0)
-      echo "MPS 状态：守护进程已停止，CUDA 进程将使用各自独立上下文。"
-      ;;
-    2)
-      echo "启动失败：ENABLE_MPS=false，但 MPS 守护进程仍有活跃客户端。" >&2
-      echo "该守护进程可能被本机其他 CUDA 进程共用，脚本不会强行停止它。" >&2
-      echo "请先停止这些客户端，或将本次启动改为 ENABLE_MPS=true。" >&2
-      echo "查看客户端：echo get_server_list | nvidia-cuda-mps-control" >&2
-      exit 1
-      ;;
-    *)
-      echo "启动失败：停止 MPS 守护进程超时或失败。" >&2
-      echo "请手工确认：ps -eo pid,ppid,cmd | grep '[n]vidia-cuda-mps'" >&2
-      exit 1
-      ;;
-  esac
-else
-  echo "MPS 状态：守护进程不在线，CUDA 进程使用各自独立上下文。"
-fi
-
 python -c 'import importlib, importlib.metadata as m; version=m.version("vllm"); assert version == "0.19.1", f"需要 vllm==0.19.1，当前为 {version}"; importlib.import_module("vllm.transformers_utils.configs.qwen3_asr")' || {
   echo "当前环境不兼容；请在独立虚拟环境执行: python -m pip install -r requirements-infer.txt" >&2
   exit 1
@@ -256,10 +140,22 @@ python -c 'import torch; cuda=torch.version.cuda; assert cuda and cuda.startswit
   echo "PyTorch 与宿主 NVIDIA 驱动不兼容；请使用 CUDA 12.9 基础镜像，或将宿主驱动升级到 580 以上。" >&2
   exit 1
 }
-python scripts/download_model.py \
-  --model-id "$VLLM_MODEL_ID" \
-  --dir "$VLLM_MODEL_DIR" \
-  --revision "$MODELSCOPE_REVISION"
+case "${VLLM_MODEL_SOURCE,,}" in
+  modelscope)
+    python scripts/download_model.py \
+      --model-id "$VLLM_MODEL_ID" \
+      --dir "$VLLM_MODEL_DIR" \
+      --revision "$MODELSCOPE_REVISION"
+    ;;
+  local)
+    echo "=== 本地主模型模式：只读校验 $VLLM_MODEL_DIR，不访问 ModelScope ==="
+    python scripts/download_model.py --dir "$VLLM_MODEL_DIR" --verify-local
+    ;;
+  *)
+    echo "配置错误：VLLM_MODEL_SOURCE 只允许 modelscope 或 local，当前为 '$VLLM_MODEL_SOURCE'。" >&2
+    exit 1
+    ;;
+esac
 if enabled "$ENABLE_WORD_TIMESTAMP" || enabled "$ENABLE_SENTENCE_TIMESTAMP"; then
   python -c 'import importlib.metadata as m; from qwen_asr import Qwen3ForcedAligner; assert m.version("qwen-asr") == "0.0.6"' || {
     echo "时间戳功能已开启，但镜像未安装 qwen-asr==0.0.6。" >&2
@@ -302,16 +198,6 @@ until python -c 'import sys,urllib.request; urllib.request.urlopen(sys.argv[1],t
   (( SECONDS < DEADLINE )) || { echo "等待 vLLM 就绪超时（${VLLM_STARTUP_TIMEOUT}s）" >&2; exit 1; }
   sleep 2
 done
-
-if enabled "$ENABLE_MPS"; then
-  if ! mps_server_ready; then
-    echo "MPS 校验失败：vLLM 已就绪，但未创建任何 MPS server。" >&2
-    echo "说明该进程没有作为 MPS 客户端运行，通常是启动时未继承 CUDA_MPS_PIPE_DIRECTORY。" >&2
-    echo "请确认守护进程存活、容器共享 IPC，并在同一环境变量下重新启动。" >&2
-    exit 1
-  fi
-  echo "MPS 校验通过：vLLM 已作为 MPS 客户端接入。"
-fi
 
 echo "=== vLLM 已就绪，启动对外网关 $GATEWAY_HOST:$GATEWAY_PORT ==="
 # 仅网关 stdout 恢复到容器原始 stdout，便于采集器按严格 JSON 解析。

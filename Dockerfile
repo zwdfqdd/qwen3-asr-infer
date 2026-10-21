@@ -1,7 +1,7 @@
 # Qwen3-ASR 原生 vLLM 0.19.1 + aiohttp 网关运行镜像。
 # 必须使用 CUDA 12.9 的 x86_64 基础镜像；cu130 变体需要 580+ 驱动，目标宿主为 535。
 # 不包含 TensorRT、ONNX、VAD、CT 标点或 Faiss；模型、测试和验收数据从构建上下文打入镜像。
-FROM zhxgharbor.istarshine.com/asr/vllm-openai:v0.19.1-x86_64
+FROM zhxgharbor.istarshine.com/asr/vllm-openai:v0.19.1
 
 USER root
 WORKDIR /qwen3asr_infer

@@ -44,7 +44,8 @@ services:
       LOG_RETENTION_DAYS: "${LOG_RETENTION_DAYS:-7}"
       LOG_QUEUE_SIZE: "${LOG_QUEUE_SIZE:-10000}"
 
-      # 镜像内 ModelScope 固定 revision 模型；run.sh 启动时仍执行完整性校验。
+      # 主模型来源：modelscope 会同步官方固定 revision；local 只读验真微调模型且绝不联网/覆盖。
+      VLLM_MODEL_SOURCE: "${VLLM_MODEL_SOURCE:-modelscope}"
       VLLM_MODEL_ID: "${VLLM_MODEL_ID:-Qwen/Qwen3-ASR-0.6B}"
       VLLM_MODEL_DIR: "${VLLM_MODEL_DIR:-models/qwen3-asr-0.6b/vllm}"
       MODELSCOPE_REVISION: "${MODELSCOPE_REVISION:-4ce9cc728b473a5aedbe7b6e1ea45646316824dc}"
@@ -65,12 +66,11 @@ services:
 
       # 网关限制：时长/超时单位秒，大小单位 MiB，并发项单位为任务数。
       AUDIO_CHUNK_SECONDS: "${AUDIO_CHUNK_SECONDS:-32}"
-      MAX_AUDIO_SECONDS: "${MAX_AUDIO_SECONDS:-7500}"
+      MAX_AUDIO_SECONDS: "${MAX_AUDIO_SECONDS:-2000}"
       # MAX_UPLOAD_MB 限制解码后音频/multipart 文件；MAX_JSON_BODY_MB 限制完整 JSON 请求体。
-      # 两者按 7500 秒 16 kHz 单声道 PCM16 WAV 推导：音频 240,000,044 字节约 228.88 MiB，
-      # Base64 膨胀 4/3 后约 305.18 MiB。三项互相绑定，改时长必须同步重算字节上限。
-      MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-229}"
-      MAX_JSON_BODY_MB: "${MAX_JSON_BODY_MB:-308}"
+      # Base64 会膨胀约 1/3，因此两者同为 280 时，Base64 接口会先受 JSON 请求体上限约束。
+      MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-280}"
+      MAX_JSON_BODY_MB: "${MAX_JSON_BODY_MB:-280}"
       CHUNK_CONCURRENCY: "${CHUNK_CONCURRENCY:-3}"
       LONG_CHUNKS_IN_FLIGHT: "${LONG_CHUNKS_IN_FLIGHT:-96}"
       BACKEND_TIMEOUT: "${BACKEND_TIMEOUT:-300}"
@@ -94,36 +94,12 @@ services:
       ALIGNER_DTYPE: "${ALIGNER_DTYPE:-bfloat16}"
       ALIGNER_ATTENTION_BACKEND: "${ALIGNER_ATTENTION_BACKEND:-auto}"
       ALIGNER_CONCURRENCY: "${ALIGNER_CONCURRENCY:-1}"
-      # batch=32 为目标 A10 实测最佳平衡：端到端 107.33→228.57 audio_s/s，显存峰值约 20315 MiB。
-      # batch=1 保留为逐片回滚值；放大到 48 已因收益不足 5% 被拒绝。
-      ALIGNER_BATCH_SIZE: "${ALIGNER_BATCH_SIZE:-32}"
+      ALIGNER_BATCH_SIZE: "${ALIGNER_BATCH_SIZE:-1}"
       ALIGNER_DECODE_WORKERS: "${ALIGNER_DECODE_WORKERS:-1}"
       ALIGNER_PREDECODE_ENABLED: "${ALIGNER_PREDECODE_ENABLED:-false}"
       ALIGNER_PREDECODE_MAX_MB: "${ALIGNER_PREDECODE_MAX_MB:-128}"
       ALIGNER_BATCH_WAIT_MS: "${ALIGNER_BATCH_WAIT_MS:-5}"
       ALIGNER_QUEUE_SIZE: "${ALIGNER_QUEUE_SIZE:-256}"
-      # 分片级流水已实测拒绝：并发 96/4/1 为 -1.52%/+0.84%/+5.26%，它会打散动态微批。
-      # 生产保持 false；详见 docs/性能实验台账.md 的 PERF-ALI-009。
-      ALIGNER_PIPELINE_ENABLED: "${ALIGNER_PIPELINE_ENABLED:-false}"
-
-      # NVIDIA MPS：让 vLLM 与 Aligner 的 kernel 并发执行，目标 A10 实测端到端吞吐
-      # +19.97%、P95 -16.32%，显存仅增加约 217 MiB。
-      # MPS 是宿主级透明特性，仅靠环境变量无法决定是否走 MPS，因此 run.sh 会主动管理守护
-      # 进程：true 时不在线就启动，false 时在线且无活跃客户端就停止；有活跃客户端则拒绝启动，
-      # 不强行影响可能共用该守护进程的其他进程。两个方向的不一致都会让吞吐相差约 20%。
-      # 容器内启动守护进程需要 ipc: host；未挂载管道目录时容器看不到宿主守护进程。
-      ENABLE_MPS: "${ENABLE_MPS:-false}"
-      CUDA_MPS_PIPE_DIRECTORY: "${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}"
-      CUDA_MPS_LOG_DIRECTORY: "${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log}"
-
-    # 使用 MPS 需要额外放开容器隔离，因此不设为默认值。需要时取消以下注释：
-    #   ipc: host
-    #   并在上方 volumes 增加：
-    #     - /tmp/nvidia-mps:/tmp/nvidia-mps
-    #     - /tmp/nvidia-mps-log:/tmp/nvidia-mps-log
-    # ipc: host 会与宿主共享 IPC 命名空间，降低容器隔离性；请按安全要求评估后再启用。
-    # 未挂载管道目录时，容器内进程看不到宿主守护进程，因此不会接入 MPS。
-    # 实测故障场景：网关退出、网关重启、控制守护进程被强杀均不影响 vLLM 与时间戳正确性。
 
     deploy:
       resources:

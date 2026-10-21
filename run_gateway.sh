@@ -20,11 +20,11 @@ export LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"
 export LOG_QUEUE_SIZE="${LOG_QUEUE_SIZE:-10000}"
 
 # 音频与请求限制：大小单位 MiB，时长/超时单位秒，并发项单位为在途任务数。
-# 字节上限按 7500 秒 16 kHz 单声道 PCM16 WAV 推导：音频 229 MiB、Base64 JSON 请求体 308 MiB。
+# 280 MiB JSON 会因 Base64 约 1/3 膨胀而先于同值音频上限触发。
 export AUDIO_CHUNK_SECONDS="${AUDIO_CHUNK_SECONDS:-32}"  # 长音频单个物理分片的最长秒数。
-export MAX_AUDIO_SECONDS="${MAX_AUDIO_SECONDS:-7500}"  # 解码后按采样帧计算的最大总秒数。
-export MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-229}"  # 解码后音频或 multipart 文件上限，MiB。
-export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-308}"  # 完整 Base64 JSON 请求体上限，MiB。
+export MAX_AUDIO_SECONDS="${MAX_AUDIO_SECONDS:-2000}"  # 解码后按采样帧计算的最大总秒数。
+export MAX_UPLOAD_MB="${MAX_UPLOAD_MB:-280}"  # 解码后音频或 multipart 文件上限，MiB。
+export MAX_JSON_BODY_MB="${MAX_JSON_BODY_MB:-280}"  # 完整 Base64 JSON 请求体上限，MiB。
 export CHUNK_CONCURRENCY="${CHUNK_CONCURRENCY:-3}"  # 单个长请求最多并发提交的分片数。
 export LONG_CHUNKS_IN_FLIGHT="${LONG_CHUNKS_IN_FLIGHT:-96}"  # 全局长音频分片在途任务上限。
 export BACKEND_TIMEOUT="${BACKEND_TIMEOUT:-300}"  # 每个 vLLM 分片 HTTP 请求超时秒数。
@@ -47,46 +47,12 @@ export ALIGNER_DEVICE="${ALIGNER_DEVICE:-cuda:0}"  # Aligner 执行设备，如 
 export ALIGNER_DTYPE="${ALIGNER_DTYPE:-bfloat16}"  # Aligner 精度；CPU 必须使用 float32。
 export ALIGNER_ATTENTION_BACKEND="${ALIGNER_ATTENTION_BACKEND:-auto}"  # auto 保持现状；显式后端失败时拒绝启动。
 export ALIGNER_CONCURRENCY="${ALIGNER_CONCURRENCY:-1}"  # 并发模型 worker 数；共享模型需验证线程安全。
-# batch=32 为目标 A10 实测最佳平衡；batch=1 保留为逐片回滚值。与 run.sh 保持一致。
-export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-32}"  # 单次模型调用跨请求合并的最大物理分片数。
+export ALIGNER_BATCH_SIZE="${ALIGNER_BATCH_SIZE:-1}"  # 单次模型调用跨请求合并的最大物理分片数。
 export ALIGNER_DECODE_WORKERS="${ALIGNER_DECODE_WORKERS:-1}"  # 每批 WAV 并行解码线程上限；1 保留串行回滚。
 export ALIGNER_PREDECODE_ENABLED="${ALIGNER_PREDECODE_ENABLED:-false}"  # 是否在 ASR 阶段提前有界解码 PCM。
 export ALIGNER_PREDECODE_MAX_MB="${ALIGNER_PREDECODE_MAX_MB:-128}"  # 全局已解码 PCM 驻留预算，MiB。
 export ALIGNER_BATCH_WAIT_MS="${ALIGNER_BATCH_WAIT_MS:-5}"  # 首条分片入队后的最大动态合批等待毫秒数。
 export ALIGNER_QUEUE_SIZE="${ALIGNER_QUEUE_SIZE:-256}"  # 有界对齐分片队列容量。
-export ALIGNER_PIPELINE_ENABLED="${ALIGNER_PIPELINE_ENABLED:-false}"  # 是否启用分片级对齐流水。
-
-# MPS 是宿主级透明特性，只靠环境变量无法决定是否走 MPS。本调试入口不启动 vLLM，也不主动
-# 改变守护进程状态（避免与并行运行的 run.sh 抢管理权），只声明状态并在不一致时拒绝启动。
-export ENABLE_MPS="${ENABLE_MPS:-false}"  # 期望的 MPS 状态；不一致时报错，由 run.sh 负责调整。
-export CUDA_MPS_PIPE_DIRECTORY="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/nvidia-mps}"  # MPS 命名管道目录。
-export CUDA_MPS_LOG_DIRECTORY="${CUDA_MPS_LOG_DIRECTORY:-/tmp/nvidia-mps-log}"  # MPS 控制日志目录。
-
-mps_online=false
-if command -v nvidia-cuda-mps-control >/dev/null 2>&1 \
-  && [[ "$(echo get_server_list | nvidia-cuda-mps-control 2>&1)" != *"Cannot find MPS control daemon"* ]]; then
-  mps_online=true
-fi
-
-case "${ENABLE_MPS,,}" in
-  true|1|yes|on)
-    if [[ "$mps_online" != "true" ]]; then
-      echo "配置错误：ENABLE_MPS=true，但 MPS 控制守护进程不可用（$CUDA_MPS_PIPE_DIRECTORY）。" >&2
-      echo "请先执行 nvidia-cuda-mps-control -d；守护进程缺失会导致吞吐静默下降且无告警。" >&2
-      exit 1
-    fi
-    echo "MPS 状态：守护进程在线（$CUDA_MPS_PIPE_DIRECTORY），网关将作为 MPS 客户端运行。"
-    ;;
-  *)
-    if [[ "$mps_online" == "true" ]]; then
-      echo "配置错误：ENABLE_MPS=false，但 MPS 守护进程正在运行（$CUDA_MPS_PIPE_DIRECTORY）。" >&2
-      echo "网关仍会作为 MPS 客户端运行，性能结果不可与无 MPS 基线比较。" >&2
-      echo "请先停止守护进程：echo quit | nvidia-cuda-mps-control" >&2
-      exit 1
-    fi
-    echo "MPS 状态：守护进程不在线，网关使用独立 CUDA 上下文。"
-    ;;
-esac
 
 if [[ "$ALIGNER_ATTENTION_BACKEND" == "flash_attention_2" ]]; then
   if ! python -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("flash_attn") else 1)'; then

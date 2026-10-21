@@ -20,7 +20,7 @@ Prompt、错误契约与健康/指标代理。v2.1.0 对外只暴露 `8080`。
 |---|---|
 | `/chinese_asr` Base64 JSON | 已实现 |
 | `/v1/audio/transcriptions` multipart 文本转写 | 已实现；仅有限兼容，不宣称完整 OpenAI API |
-| 0～7500 秒音频、超过 32 秒固定切分 | 已实现；7500 秒场景的内存与尾延迟仍待实测 |
+| 0～2000 秒音频、超过 32 秒固定切分 | 已实现 |
 | 动态热词 | 已实现；Qwen3-ASR Prompt 软偏置，不保证强制命中 |
 | 主模型标点 | 已实现；直接使用 Qwen3-ASR 输出，不使用 CT-Transformer |
 | 主模型语种识别 | 已实现；30 种语言与 22 种中国方言/口音，逐物理分片填充 `slid` |
@@ -106,8 +106,53 @@ docker run -d --gpus '"device=0"' --restart=always \
   -p 8080:8080 qwen3-asr-infer:0.19.1
 ```
 
-主模型固定 revision 为 `4ce9cc728b473a5aedbe7b6e1ea45646316824dc`。下载器校验文件大小
-与 SHA256，并在模型目录写入 `.modelscope-manifest.json`；镜像启动时仍会执行完整性校验。
+主模型固定 revision 为 `4ce9cc728b473a5aedbe7b6e1ea45646316824dc`。默认
+`VLLM_MODEL_SOURCE=modelscope`，下载器校验文件大小与 SHA256，并在模型目录写入
+`.modelscope-manifest.json`；镜像启动时仍执行完整性校验。不要把微调权重复制到该官方目录后
+仍用默认模式启动：当前版本检测到已存在但与官方固定 revision 哈希不一致的文件时会**拒绝启动且
+绝不覆盖**，只会下载真正缺失的官方文件；同时保留 `generation_config.json`。旧版本曾自动下载
+官方同名文件覆盖微调权重，这正是引入下述本地模式与冲突拒绝保护的原因。
+
+### 使用本地微调模型
+
+本地微调模型必须显式使用 `VLLM_MODEL_SOURCE=local`。该模式不访问 ModelScope、不创建下载锁、
+不删除 `generation_config.json`，也不写入或覆盖任何模型文件；启动前只读校验
+`.local-model-manifest.json` 中登记的全部文件大小和 SHA256。模型继续放在原目录
+`models/qwen3-asr-0.6b/vllm`，无需新增或迁移目录：
+
+```bash
+# 1. 把微调模型完整复制到原目录后，显式生成本地 manifest。
+python scripts/download_model.py \
+  --dir models/qwen3-asr-0.6b/vllm \
+  --create-local-manifest
+
+# 2. 启动时明确选择 local；VLLM_MODEL_DIR 保持原值。
+VLLM_MODEL_SOURCE=local \
+VLLM_MODEL_DIR=models/qwen3-asr-0.6b/vllm \
+bash run.sh
+```
+
+每次重新训练或手动替换原目录中的模型文件后，需在确认复制完整后重新显式执行
+`--create-local-manifest`；不要用跳过校验的方式启动。若只想预检，可执行：
+
+```bash
+python scripts/download_model.py \
+  --dir models/qwen3-asr-0.6b/vllm \
+  --verify-local
+```
+
+Docker 仍使用容器内原目录；若模型来自宿主机，可把同一目录只读挂载到原位置：
+
+```bash
+docker run -d --gpus '"device=0"' --restart=always -p 8080:8080 \
+  -v "$(pwd)/models/qwen3-asr-0.6b/vllm:/qwen3asr_infer/models/qwen3-asr-0.6b/vllm:ro" \
+  -e VLLM_MODEL_SOURCE=local \
+  -e VLLM_MODEL_DIR=models/qwen3-asr-0.6b/vllm \
+  qwen3-asr-infer:0.19.1
+```
+
+`.local-model-manifest.json` 必须在挂载前生成。local 模式只改变主 ASR 模型来源；时间戳仍按
+`ALIGNER_MODEL_DIR` 使用固定 ModelScope ForcedAligner，除非关闭两个时间戳开关。
 
 `/chinese_asr` 不传 `language` 时由主模型逐物理分片自动检测并填入 `slid`。主模型官方范围
 是 30 种语言与 22 种中国方言/口音；默认 ForcedAligner 仅支持其中 11 种语言。支持的分片
@@ -124,9 +169,9 @@ python tests/test_chinese_asr_single.py --audio test_data/audio_16000_10s.wav
 
 ## 默认输入与性能基线
 
-当前默认 `AUDIO_CHUNK_SECONDS=32`、`MAX_AUDIO_SECONDS=7500`、`MAX_UPLOAD_MB=229`、
-`MAX_JSON_BODY_MB=308`。两个字节上限按 7500 秒 16 kHz 单声道 PCM16 WAV 推导：音频约
-228.88 MiB，Base64 后约 305.18 MiB；multipart 仍由请求体和音频上限共同约束。时长与两层字节限制分别保护
+当前默认 `AUDIO_CHUNK_SECONDS=32`、`MAX_AUDIO_SECONDS=2000`、`MAX_UPLOAD_MB=280`、
+`MAX_JSON_BODY_MB=280`。Base64 会膨胀约 1/3，因此 280 MiB JSON 请求体只能承载约 210 MiB
+原始音频；multipart 仍由 280 MiB 请求体和音频上限共同约束。时长与两层字节限制分别保护
 解码后音频、HTTP 接收和进程内存。
 
 当前默认 `CHUNK_CONCURRENCY=3`、`LONG_CHUNKS_IN_FLIGHT=96`。网关到 vLLM 的连接池上限
@@ -136,7 +181,7 @@ Chat/多模态预处理触发的 `RuntimeError: Already borrowed` 和上游 HTTP
 ASR-only 三轮累计 8000/8000。正式三轮中位数为 114.18 QPS、1141.75 audio_s/s、平均延迟
 824.0 ms、P95 1055.5 ms、P99 1606.0 ms。默认时间戳六轮中位数为 11.005 QPS、110.025
 audio_s/s，当前确定瓶颈是串行同卡 Aligner，而不是 ASR 数据面。`dev` 已实现 Aligner
-有界跨请求动态微批；生产默认为 `ALIGNER_CONCURRENCY=1`、`ALIGNER_BATCH_SIZE=32`。目标
+有界跨请求动态微批；生产默认仍保持 `ALIGNER_CONCURRENCY=1`、`ALIGNER_BATCH_SIZE=1`。目标
 A10 的 batch=4/8/16/32 单轮性能诊断均达到数值晋级线，其中 batch=32 达到 220.03
 audio_s/s、P95 4641.8 ms、P99 5585.0 ms，当前是最佳平衡候选。batch=48 虽升至 228.99
 audio_s/s，但仅增加 4.1%、P95 恶化 4.9%、显存升至 21821 MiB，已越过工程晋级拐点。
@@ -149,42 +194,10 @@ attention=auto 已确认实际使用 SDPA，当前固定镜像缺少 `flash_attn
 未达到晋级线，已拒绝并恢复 1，不再测试其他线程数。`dev` 随后实现默认关闭的有界预解码；
 目标 A10 中预解码命中率 100%、残余等待仅 0.01 ms、批内解码降至 0.03 ms，但同卡
 `model.align()` 从 1097.04 增至 1351.02 ms，吞吐仅 +1.84%、P95 -1.58%，仍未晋级并恢复关闭。
-官方 `align()` 已使用 `torch.inference_mode()`。后续 vLLM token-classify 路线虽取得 +188.1%
-原始吞吐，但生产 oracle 仅 6/11，继续逐层修复不划算，`PERF-ARCH-001` 已拒绝且不再重复 spike。
-当前 `PERF-ARCH-002` TensorRT FP16 已完成固定 batch=1、固定 shape 探针：音频改写、文本
-mask 改写和 strict 导出图回放的 logits 最大差均为 0.0，timestamp argmax 完全一致；捕获时的
-`_export_root` potential side-effect warning 已留证。动态 T1 首轮的 10 秒/7 秒 eager 门禁通过，
-但任意 100～3200 帧声明在 strict shape guard 阶段失败；收紧为 2～32 个完整 100 帧 chunk
-后，10 秒/7 秒改写 eager、strict 动态导出和同一图双 shape 回放均已通过。T1.1 已实现固定
-尾帧余数、动态完整 chunk 数的尾块图；1.602188 秒首轮因 `audio_full_chunks=1` 被专门化而
-失败；将下限固定为 2 后，11.334188 秒→追加 1 秒静音的 T1.1 strict 动态导出与异 shape
-回放已通过。该结果只证明一个固定尾帧余数 profile。T1.2 随后在目标 A10 通过同 CNN 输出
-长度桶规范化：原始主输入为 1133 帧（11 个完整 chunk + tail=33），候选补 7 帧到 1140；原始
-回放为 1237 帧（12 个完整 chunk + tail=37），候选补 3 帧到 1240。两者 CNN 尾块输出长度均为
-5，canonical tail 均为 40。主/回放的音频改写、文本 mask、strict 动态图回放共六处比较均
-logits 逐位一致、最大差 0.0，36 个 timestamp bucket argmax 全部一致，
-`summary.dynamic_shape_export=true`。输出桶 13 边界随后也通过：原始 1197/1298 帧、
-tail=97/98 分别补 2/1 帧到候选 1199/1299，canonical tail=99、CNN 输出长度 13；
-`tail_padding=1`、`tail_output_drop=0`。六处 logits 同样逐位一致、最大差 0.0，timestamp
-argmax 完全一致。输出桶 1 最大裁剪边界也已通过：原始 1201/1308 帧、tail=1/8，候选
-1208/1308 帧、canonical tail=8、CNN 输出长度 1；`tail_padding=92`、`tail_output_drop=12`。
-六处 logits 仍逐位一致、最大差 0.0。其余 10 桶随后按独立 strict export 顺序执行并 10/10
-通过；至此 13/13 个 CNN 输出桶均保持六处 logits 逐位一致、最大差 0.0、timestamp argmax 一致，
-且都保留 `_export_root` potential side-effect warning。T1.2 已覆盖 `audio_full_chunks≥2` 下的
-1～99 非零尾帧余数。短音频 T1.3 的首个完整 chunk 规范化候选已被目标 A10 拒绝：160 帧
-full1 主输入最大差 0.0，但 60 帧 full0 回放最大差 1.4296875 且 timestamp argmax 不一致。
-官方 `<100` 帧单 chunk 会直接按原始宽度执行卷积，补到 100 后再裁输出无法恢复右边界语义。
-现有 full0 原生单 chunk 动态宽度探针不补帧、不裁剪；目标 A10 桶 8 的 57→64 帧先单独通过，
-随后桶 2～13 按独立 strict export 顺序执行并 11/11 通过，full0 动态域覆盖 9～99 帧。桶 1
-（1～8 帧）因 CNN 时间维恒为 1 命中 PyTorch 0/1 专门化而无法动态导出；`T=2…8` 固定
-profile 已 7/7 通过，`T=1` 官方处理器无法构造。full0 可达域至此闭合。full1 同尾块输出桶动态
-模式最终 13/13 通过，覆盖 101～199 帧；`retained_output_length` 连续覆盖 14～26，每轮六处
-逐位一致并完成 strict 同图回放。总帧 100 的固定 profile 也已在目标 A10 通过：
-`chunk_lengths=[100]`、CNN 后长度 13，音频改写、文本 mask 和导出回放三处 logits 均逐位一致、
-最大差 0.0。实际可达的 2～3200 帧 `torch.export` 输入域已闭合；下一步只在独立精确固定环境
-验证 ONNX/TensorRT，仍不修改生产路径。生产继续保持 PyTorch
-ForcedAligner、batch=32 和可选 MPS。历史 A10 纯 90 秒测试中 `3/96` 吞吐最高；仍须在
-0～7500 秒真实混合流量下复测。详细数据和方法见 [性能调优](docs/性能调优.md)。
+官方 `align()` 已使用 `torch.inference_mode()`，单卡软件路线收敛；下一步只能验证独立 Aligner
+GPU/实例拓扑。重复性、时间戳、混合流量与 CER 门禁完成前，不得修改生产默认值。历史 A10 纯 90 秒
+测试中 `3/96` 吞吐最高；仍须在 0～2000 秒真实混合流量下复测。详细数据和方法见
+[性能调优](docs/性能调优.md)。
 
 ## 文档
 
